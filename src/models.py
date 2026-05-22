@@ -5,7 +5,6 @@ from pydantic import BaseModel
 
 
 class Draft(BaseModel):
-    id: str
     account: str
     to: str
     subject: str
@@ -22,6 +21,7 @@ class Promise(BaseModel):
     source_detail: Optional[str] = None
     created_at: datetime
     status: str = "open"
+    account: Optional[str] = None
 
 
 class Account(BaseModel):
@@ -30,6 +30,7 @@ class Account(BaseModel):
     providers: list[str] = ["gmail", "chat"]
     enabled: bool = True
     created_at: datetime = datetime.now()
+    chat_id: Optional[int] = None
 
 
 class ChatSummary(BaseModel):

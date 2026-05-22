@@ -55,11 +55,18 @@ async def telegram_webhook(request: Request, body: dict):
     if not chat_id or not text:
         return {"ok": True}
 
-    # Save chat_id on /start
+    # Save chat_id on /start (but don't overwrite existing one)
     if text == "/start":
-        s = await get_settings()
-        s.telegram_chat_id = chat_id
-        await save_settings(s)
+        s_start = await get_settings()
+        if s_start.telegram_chat_id and s_start.telegram_chat_id != chat_id:
+            await send_message(
+                settings.telegram_bot_token,
+                chat_id,
+                "This bot is already configured for another user.",
+            )
+            return {"ok": True}
+        s_start.telegram_chat_id = chat_id
+        await save_settings(s_start)
         await send_message(
             settings.telegram_bot_token,
             chat_id,
@@ -73,9 +80,29 @@ async def telegram_webhook(request: Request, body: dict):
         )
         return {"ok": True}
 
+    # Check if this chat has any accounts (fall back to owner's accounts for backward compat)
+    s = await get_settings()
+    is_owner = chat_id == s.telegram_chat_id
+    my_accounts = await list_accounts(chat_id=chat_id)
+    if my_accounts:
+        account_emails = [a.email for a in my_accounts]
+    elif is_owner:
+        my_accounts = await list_accounts()
+        account_emails = None
+    else:
+        await send_message(
+            settings.telegram_bot_token, chat_id, "No accounts linked to this chat."
+        )
+        return {"ok": True}
+
+    def filter_by_account(items: list[dict]) -> list[dict]:
+        if account_emails is None:
+            return items
+        return [i for i in items if i.get("account") in account_emails]
+
     if text == "/status":
-        drafts = await get_pending_drafts()
-        promises = await get_open_promises()
+        drafts = filter_by_account(await get_pending_drafts())
+        promises = filter_by_account(await get_open_promises())
         draft_text = f"{len(drafts)} pending drafts" if drafts else "no pending drafts"
         promise_text = f"{len(promises)} open promises" if promises else "no open promises"
         state = await get_state()
@@ -85,7 +112,7 @@ async def telegram_webhook(request: Request, body: dict):
         return {"ok": True}
 
     if text.startswith("/drafts"):
-        drafts = await get_pending_drafts()
+        drafts = filter_by_account(await get_pending_drafts())
         if not drafts:
             await send_message(settings.telegram_bot_token, chat_id, "No pending drafts.")
             return {"ok": True}
@@ -116,7 +143,7 @@ async def telegram_webhook(request: Request, body: dict):
             return {"ok": True}
         context = parts[2]
 
-        drafts_list = await get_pending_drafts()
+        drafts_list = filter_by_account(await get_pending_drafts())
         if idx < 0 or idx >= len(drafts_list):
             await send_message(settings.telegram_bot_token, chat_id, "Draft number out of range")
             return {"ok": True}
@@ -140,8 +167,7 @@ async def telegram_webhook(request: Request, body: dict):
 
         await update_draft(draft["id"], {"subject": new_subject, "body": new_body})
 
-        accounts = await list_accounts()
-        for acc in accounts:
+        for acc in my_accounts:
             if acc.email == draft.get("account"):
                 await asyncio.to_thread(
                     create_draft,
@@ -181,8 +207,8 @@ async def telegram_webhook(request: Request, body: dict):
             await send_message(settings.telegram_bot_token, chat_id, "Usage: /chat <question>")
             return {"ok": True}
         question = parts[1]
-        drafts = await get_pending_drafts()
-        promises = await get_open_promises()
+        drafts = filter_by_account(await get_pending_drafts())
+        promises = filter_by_account(await get_open_promises())
         state = await get_state()
         response = await answer_question(
             question=question,
@@ -257,7 +283,8 @@ async def _process_accounts():
                         signature=settings.signature,
                     )
                     for draft in result.drafts:
-                        draft_id = await save_draft(draft.model_dump())
+                        draft_data = draft.model_dump()
+                        draft_id = await save_draft(draft_data)
                         gmail_draft_id = await asyncio.to_thread(
                             create_draft,
                             account=account,
@@ -276,7 +303,9 @@ async def _process_accounts():
                             log.error("Failed to create Gmail draft: %s -> %s", draft.subject, draft.to)
 
                     for p in result.promises:
-                        await save_promise(p.model_dump())
+                        p_data = p.model_dump()
+                        p_data["account"] = account.email
+                        await save_promise(p_data)
                         all_promises.append(p)
 
                     all_email_items.extend(result.summary_items)
@@ -309,7 +338,9 @@ async def _process_accounts():
                             api_url=settings.deepseek_api_url,
                         )
                         for p in result.promises:
-                            await save_promise(p.model_dump())
+                            p_data = p.model_dump()
+                            p_data["account"] = account.email
+                            await save_promise(p_data)
                             all_promises.append(p)
 
                         if result.missed_questions:

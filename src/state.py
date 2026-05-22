@@ -9,8 +9,11 @@ from src.models import Account, GlobalState, SettingsModel
 db = firestore.AsyncClient()
 
 
-async def list_accounts() -> list[Account]:
-    docs = db.collection("accounts").where("enabled", "==", True).stream()
+async def list_accounts(chat_id: int | None = None) -> list[Account]:
+    query = db.collection("accounts").where("enabled", "==", True)
+    if chat_id is not None:
+        query = query.where("chat_id", "==", chat_id)
+    docs = query.stream()
     result = []
     async for doc in docs:
         data = doc.to_dict()
@@ -68,7 +71,8 @@ async def save_promise(promise_data: dict) -> str:
 
 
 async def get_open_promises() -> list[dict]:
-    docs = db.collection("promises").where("status", "==", "open").stream()
+    query = db.collection("promises").where("status", "==", "open")
+    docs = query.stream()
     result = []
     async for doc in docs:
         data = doc.to_dict()

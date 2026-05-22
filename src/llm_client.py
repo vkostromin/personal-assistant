@@ -3,7 +3,6 @@ import logging
 from datetime import datetime
 
 import httpx
-from uuid import uuid4
 
 log = logging.getLogger(__name__)
 
@@ -66,7 +65,6 @@ async def analyze_emails(
     now = datetime.now()
     drafts = [
         Draft(
-            id=str(uuid4()),
             account=account,
             to=d.get("to", ""),
             subject=d.get("subject", ""),

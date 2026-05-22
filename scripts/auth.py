@@ -18,6 +18,7 @@ You'll be prompted to:
 Requires PROJECT_ID env var (or set in .env).
 """
 
+import argparse
 import os
 import sys
 from datetime import datetime
@@ -36,7 +37,7 @@ CLIENT_SECRET_FILE = os.environ.get(
 )
 
 
-def save_to_firestore(email: str, refresh_token: str, project_id: str) -> None:
+def save_to_firestore(email: str, refresh_token: str, project_id: str, chat_id: int | None = None) -> None:
     from google.cloud import firestore
 
     encryption_key = os.environ.get("TOKEN_ENCRYPTION_KEY", "")
@@ -45,20 +46,26 @@ def save_to_firestore(email: str, refresh_token: str, project_id: str) -> None:
         refresh_token = encrypt(refresh_token, encryption_key)
 
     db = firestore.Client(project=project_id)
-    db.collection("accounts").document(email).set(
-        {
-            "refresh_token": refresh_token,
-            "providers": ["gmail", "chat"],
-            "enabled": True,
-            "created_at": datetime.now(),
-        }
-    )
+    data = {
+        "refresh_token": refresh_token,
+        "providers": ["gmail", "chat"],
+        "enabled": True,
+        "created_at": datetime.now(),
+    }
+    if chat_id is not None:
+        data["chat_id"] = chat_id
+    db.collection("accounts").document(email).set(data)
     print(f"✅ Account saved to Firestore: accounts/{email}")
 
 
 def main():
-    # Accept email from CLI arg, env var, or interactive prompt
-    email_arg = sys.argv[1] if len(sys.argv) > 1 else os.environ.get("ACCOUNT_EMAIL", "")
+    parser = argparse.ArgumentParser(description="Authorize a Google account")
+    parser.add_argument("email", nargs="?", help="Google email address")
+    parser.add_argument("--chat-id", type=int, help="Telegram chat ID to associate with this account")
+    args = parser.parse_args()
+
+    email_arg = args.email or os.environ.get("ACCOUNT_EMAIL", "")
+    chat_id = args.chat_id
 
     if not os.path.exists(CLIENT_SECRET_FILE):
         print(f"Error: OAuth client secret file not found at {CLIENT_SECRET_FILE}")
@@ -97,7 +104,7 @@ def main():
         print("Email is required. Pass it as argument: python3 scripts/auth.py user@gmail.com")
         sys.exit(1)
 
-    save_to_firestore(email, creds.refresh_token, project_id)
+    save_to_firestore(email, creds.refresh_token, project_id, chat_id=chat_id)
 
     print()
     print(f"Refresh token: {creds.refresh_token}")
