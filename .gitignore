@@ -1,0 +1,24 @@
+# Secrets
+.env
+credentials.json
+client_secret*.json
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+
+# Virtual environment
+.venv/
+venv/
+
+# macOS
+.DS_Store
+
+# IDE
+.idea/
+.vscode/
+*.swp
+
+# Docker
+.dockerignore

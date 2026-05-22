@@ -1,0 +1,44 @@
+steps:
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - build
+      - -t
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/assistant/assistant:$_TAG
+      - .
+
+  - name: gcr.io/cloud-builders/docker
+    args:
+      - push
+      - ${_REGION}-docker.pkg.dev/$PROJECT_ID/assistant/assistant:$_TAG
+
+  - name: gcr.io/google.com/cloudsdktool/cloud-sdk
+    entrypoint: gcloud
+    args:
+      - run
+      - deploy
+      - personal-assistant
+      - --image=${_REGION}-docker.pkg.dev/$PROJECT_ID/assistant/assistant:$_TAG
+      - --region=${_REGION}
+      - --platform=managed
+      - --allow-unauthenticated
+      - --min-instances=0
+      - --max-instances=1
+      - --concurrency=1
+      - --cpu=1
+      - --memory=256Mi
+      - --timeout=300
+      - --set-env-vars=^|^PROJECT_ID=$PROJECT_ID|REGION=${_REGION}|TELEGRAM_BOT_TOKEN=${_TELEGRAM_BOT_TOKEN}|DEEPSEEK_API_KEY=${_DEEPSEEK_API_KEY}|DEEPSEEK_API_URL=${_DEEPSEEK_API_URL}|GOOGLE_CLIENT_ID=${_GOOGLE_CLIENT_ID}|GOOGLE_CLIENT_SECRET=${_GOOGLE_CLIENT_SECRET}|TOKEN_ENCRYPTION_KEY=${_TOKEN_ENCRYPTION_KEY}|TELEGRAM_WEBHOOK_SECRET=${_TELEGRAM_WEBHOOK_SECRET}
+
+substitutions:
+  _REGION: us-central1
+  _TAG: latest
+  _TELEGRAM_BOT_TOKEN: ""
+  _DEEPSEEK_API_KEY: ""
+  _DEEPSEEK_API_URL: "https://opencode.ai/zen/go/v1/chat/completions"
+  _GOOGLE_CLIENT_ID: ""
+  _GOOGLE_CLIENT_SECRET: ""
+  _TOKEN_ENCRYPTION_KEY: ""
+  _TELEGRAM_WEBHOOK_SECRET: ""
+
+options:
+  logging: CLOUD_LOGGING_ONLY

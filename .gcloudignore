@@ -1,0 +1,9 @@
+.gcloudignore
+.git
+.env
+.venv
+__pycache__
+*.pyc
+*.pyo
+credentials.json
+client_secret*.json
