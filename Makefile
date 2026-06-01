@@ -12,12 +12,12 @@ auth:
 deploy:
 	gcloud builds submit --config=cloudbuild.yaml \
 		--project=$(PROJECT_ID) \
-		--substitutions=_TELEGRAM_BOT_TOKEN=$(TELEGRAM_BOT_TOKEN),_DEEPSEEK_API_KEY=$(DEEPSEEK_API_KEY),_GOOGLE_CLIENT_ID=$(GOOGLE_CLIENT_ID),_GOOGLE_CLIENT_SECRET=$(GOOGLE_CLIENT_SECRET),_TOKEN_ENCRYPTION_KEY=$(TOKEN_ENCRYPTION_KEY),_TELEGRAM_WEBHOOK_SECRET=$(TELEGRAM_WEBHOOK_SECRET)
+		--substitutions=_TELEGRAM_BOT_TOKEN=$(TELEGRAM_BOT_TOKEN),_DEEPSEEK_API_KEY=$(DEEPSEEK_API_KEY),_GOOGLE_CLIENT_ID=$(GOOGLE_CLIENT_ID),_GOOGLE_CLIENT_SECRET=$(GOOGLE_CLIENT_SECRET),_TOKEN_ENCRYPTION_KEY=$(TOKEN_ENCRYPTION_KEY),_TELEGRAM_WEBHOOK_SECRET=$(TELEGRAM_WEBHOOK_SECRET),_RUN_SECRET=$(RUN_SECRET)
 
 setup-scheduler:
 	@echo "Updating Cloud Scheduler jobs with Cloud Run URL..."
 	@URL=$$(gcloud run services describe personal-assistant --region=$(REGION) --format='value(status.url)' --project=$(PROJECT_ID)); \
-	gcloud scheduler jobs update http lola-run --location=$(REGION) --uri="$$URL/run" --project=$(PROJECT_ID)
+	gcloud scheduler jobs update http lola-run --location=$(REGION) --uri="$$URL/run" --update-headers=X-Run-Secret=$(RUN_SECRET) --project=$(PROJECT_ID)
 	@echo "Scheduler jobs updated."
 
 setup-telegram:

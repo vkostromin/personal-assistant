@@ -14,6 +14,7 @@ class Settings(BaseSettings):
 
     token_encryption_key: str = ""
     telegram_webhook_secret: str = ""
+    run_secret: str = ""
 
     model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 

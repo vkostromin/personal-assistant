@@ -239,7 +239,11 @@ async def telegram_webhook(request: Request, body: dict):
 
 
 @app.post("/run")
-async def scheduled_run():
+async def scheduled_run(request: Request):
+    secret = request.headers.get("X-Run-Secret", "")
+    if settings.run_secret and secret != settings.run_secret:
+        log.warning("Scheduled run received invalid secret token")
+        return {"status": "unauthorized"}
     await _process_accounts()
     return {"status": "ok"}
 
