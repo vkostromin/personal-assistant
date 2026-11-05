@@ -67,13 +67,16 @@ def main():
     email_arg = args.email or os.environ.get("ACCOUNT_EMAIL", "")
     chat_id = args.chat_id
 
-    if not os.path.exists(CLIENT_SECRET_FILE):
-        print(f"Error: OAuth client secret file not found at {CLIENT_SECRET_FILE}")
+    client_id = os.environ.get("GOOGLE_CLIENT_ID", "")
+    client_secret = os.environ.get("GOOGLE_CLIENT_SECRET", "")
+    if not (client_id and client_secret) and not os.path.exists(CLIENT_SECRET_FILE):
+        print("Error: OAuth client credentials not found")
         print()
-        print("To create one:")
+        print("To create them:")
         print("  1. Go to https://console.cloud.google.com/apis/credentials")
         print("  2. Create OAuth 2.0 Client ID (Desktop app type)")
-        print(f"  3. Download JSON and save as {CLIENT_SECRET_FILE}")
+        print("  3. Set GOOGLE_CLIENT_ID and GOOGLE_CLIENT_SECRET in .env")
+        print(f"     (or download the JSON and save as {CLIENT_SECRET_FILE})")
         print()
         sys.exit(1)
 
@@ -92,7 +95,21 @@ def main():
         print("Error: PROJECT_ID is not set. Add it to .env or export PROJECT_ID=...")
         sys.exit(1)
 
-    flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
+    if client_id and client_secret:
+        flow = InstalledAppFlow.from_client_config(
+            {
+                "installed": {
+                    "client_id": client_id,
+                    "client_secret": client_secret,
+                    "auth_uri": "https://accounts.google.com/o/oauth2/auth",
+                    "token_uri": "https://oauth2.googleapis.com/token",
+                    "redirect_uris": ["http://localhost"],
+                }
+            },
+            SCOPES,
+        )
+    else:
+        flow = InstalledAppFlow.from_client_secrets_file(CLIENT_SECRET_FILE, SCOPES)
     creds = flow.run_local_server(port=8080, open_browser=True)
 
     print("\n" + "=" * 60)

@@ -10,7 +10,7 @@ class Settings(BaseSettings):
     telegram_bot_token: str = ""
 
     region: str = "us-central1"
-    signature: str = "\n\n— Lola, Vladimir's AI Assistant"
+    signature: str = "\n\n— Lola, Your AI Assistant"
 
     token_encryption_key: str = ""
     telegram_webhook_secret: str = ""

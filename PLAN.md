@@ -20,7 +20,7 @@ Cloud Run Service (FastAPI) ─── POST /run
 Interactive (any time):
   Telegram message → POST /webhook → parse command → respond
 
-Cloud Run URL: https://personal-assistant-mxv6y6olsq-uc.a.run.app
+Cloud Run URL: see SERVICE_URL in .env
 ```
 
 ## Key Decisions
@@ -32,10 +32,10 @@ Cloud Run URL: https://personal-assistant-mxv6y6olsq-uc.a.run.app
 | LLM tokens | `max_tokens: 8000` — required because the endpoint uses a reasoning model |
 | State store | Firestore (free tier: 1 GiB, 50K reads/day) |
 | Secrets | Plain env vars (no Secret Manager) — set via Cloud Build substitutions |
-| Notifications | Telegram bot [@lolavkbot](https://t.me/lolavkbot) |
+| Notifications | Telegram bot (token in `.env`) |
 | Gmail integration | Direct API — fetch max 20 emails, body truncated at 2000 chars, create drafts, never auto-send |
 | Chat integration | Google Chat API — read-only |
-| Email signature | "Lola, Vladimir's AI Assistant" |
+| Email signature | Configurable via `SIGNATURE` (default "Lola, Your AI Assistant") |
 | Accounts | Multi-account ready (Firestore `accounts/{email}` doc per account) |
 | OAuth | Desktop OAuth flow → refresh token saved directly to Firestore by `scripts/auth.py` |
 | Region | us-central1 |
@@ -130,7 +130,7 @@ Cloud Run URL: https://personal-assistant-mxv6y6olsq-uc.a.run.app
    ```
 3. Create Firestore database (Native mode, us-central1)
 4. Create Artifact Registry repo: `assistant` in us-central1
-5. Create OAuth Desktop credentials in GCP Console → download JSON → save as `credentials.json`
+5. Create OAuth Desktop credentials in GCP Console → put client ID/secret into `.env`
 6. Fill in `.env` (copy from `.env.example`)
 7. `make auth` → browser OAuth → saves refresh token to Firestore automatically
 8. `make deploy` → builds container via Cloud Build → deploys to Cloud Run
@@ -148,7 +148,7 @@ make deploy
 gcloud run services update personal-assistant \
   --region=us-central1 \
   --update-env-vars=KEY=value \
-  --project=personal-assistant-lola
+  --project=$PROJECT_ID
 
 # Add a second Google account (no redeploy needed):
 make auth
