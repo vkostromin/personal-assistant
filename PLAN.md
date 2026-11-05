@@ -32,7 +32,7 @@ Cloud Run URL: see SERVICE_URL in .env
 | LLM tokens | `max_tokens: 8000` — required because the endpoint uses a reasoning model |
 | State store | Firestore (free tier: 1 GiB, 50K reads/day) |
 | Secrets | Plain env vars (no Secret Manager) — set via Cloud Build substitutions |
-| Notifications | Telegram bot (token in `.env`) |
+| Notifications | Telegram bot (see `TELEGRAM_BOT_USERNAME` in `.env`) |
 | Gmail integration | Direct API — fetch max 20 emails, body truncated at 2000 chars, create drafts, never auto-send |
 | Chat integration | Google Chat API — read-only |
 | Email signature | Configurable via `SIGNATURE` (default "Lola, Your AI Assistant") |
