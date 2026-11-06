@@ -84,6 +84,17 @@ def fetch_recent_messages(
     return messages
 
 
+def _draft_resource(to: str, subject: str, body: str, thread_id: str | None) -> dict:
+    mime = MIMEText(body, "plain", "utf-8")
+    mime["To"] = to
+    mime["Subject"] = subject
+    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
+    resource: dict = {"message": {"raw": raw}}
+    if thread_id:
+        resource["message"]["threadId"] = thread_id
+    return resource
+
+
 def create_draft(
     account: Account,
     client_id: str,
@@ -94,21 +105,44 @@ def create_draft(
     thread_id: str | None = None,
 ) -> str | None:
     service = _get_service(account, client_id, client_secret)
-    body_with_sig = body
-
-    mime = MIMEText(body_with_sig, "plain", "utf-8")
-    mime["To"] = to
-    mime["Subject"] = subject
-
-    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
-
-    draft_body = {"message": {"raw": raw}}
-    if thread_id:
-        draft_body["message"]["threadId"] = thread_id
-
     try:
-        draft = service.users().drafts().create(userId="me", body=draft_body).execute()
+        draft = service.users().drafts().create(userId="me", body=_draft_resource(to, subject, body, thread_id)).execute()
         return draft.get("id")
     except HttpError as e:
         log.error("Gmail draft creation failed: %s", e)
         return None
+
+
+def update_gmail_draft(
+    account: Account,
+    client_id: str,
+    client_secret: str,
+    draft_id: str | None,
+    to: str,
+    subject: str,
+    body: str,
+    thread_id: str | None = None,
+) -> tuple[str | None, bool]:
+    """Replace the content of an existing Gmail draft in place.
+
+    If the draft no longer exists (sent or deleted in Gmail) or was never created,
+    a new draft is created instead. Returns ``(draft_id, created_new)``;
+    ``draft_id`` is None if Gmail rejected both operations.
+    """
+    service = _get_service(account, client_id, client_secret)
+    resource = _draft_resource(to, subject, body, thread_id)
+    if draft_id:
+        try:
+            draft = service.users().drafts().update(userId="me", id=draft_id, body={"id": draft_id, **resource}).execute()
+            return draft.get("id", draft_id), False
+        except HttpError as e:
+            if e.resp.status not in (400, 404):  # 404: deleted; 400: no longer a draft (sent)
+                log.error("Gmail draft update failed: %s", e)
+                return None, False
+            log.info("Gmail draft %s no longer exists, creating a new one", draft_id)
+    try:
+        draft = service.users().drafts().create(userId="me", body=resource).execute()
+        return draft.get("id"), True
+    except HttpError as e:
+        log.error("Gmail draft creation failed: %s", e)
+        return None, False

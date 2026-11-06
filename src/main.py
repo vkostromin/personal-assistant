@@ -1,40 +1,49 @@
-import asyncio
+import html
 import logging
-from datetime import datetime, timezone
+from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
+from fastapi.responses import HTMLResponse
 
-from src.config import settings
-from src.models import Account, Promise
-from src.state import (
-    close_promise,
-    get_open_promises,
-    get_pending_drafts,
-    get_settings,
-    get_state,
-    list_accounts,
-    save_draft,
-    save_promise,
-    save_settings,
-    save_state,
-    update_draft,
-)
-from src.gmail_client import create_draft, fetch_recent_messages
-from src.chat_client import fetch_messages, list_spaces
-from src.llm_client import analyze_chat, analyze_emails, answer_question, compose_summary, rewrite_draft
-from src.telegram_client import send_message, escape_markdown
-
-from src.models import GlobalState
+from src import config
+from src.bot import handle_update, reply
+from src.models import Account
+from src.oauth import OAuthError, build_auth_url, exchange_code, parse_id_token, providers_from_scopes
+from src.runner import run_all_users
+from src.state import LinkResult, get_store
+from src.telegram_client import escape_markdown
 
 logging.basicConfig(level=logging.INFO)
 log = logging.getLogger(__name__)
 
-app = FastAPI(title="Personal Assistant")
+
+@asynccontextmanager
+async def lifespan(_app: FastAPI):
+    s = config.settings
+    if not s.telegram_webhook_secret:
+        log.warning("TELEGRAM_WEBHOOK_SECRET is not set — anyone can forge Telegram updates. Set it!")
+    if not s.run_secret:
+        log.warning("RUN_SECRET is not set — anyone can trigger /run for all users. Set it!")
+    if not s.token_encryption_key:
+        log.warning("TOKEN_ENCRYPTION_KEY is not set — refresh tokens are stored unencrypted.")
+    try:
+        await get_store().migrate_legacy()
+    except Exception as exc:  # noqa: BLE001 — never block startup on migration
+        log.error("Legacy data migration failed: %s", exc, exc_info=True)
+    yield
 
 
-@app.on_event("startup")
-async def startup():
-    pass
+app = FastAPI(title="Personal Assistant", lifespan=lifespan)
+
+
+def public_base_url(request: Request) -> str:
+    """Base URL used for OAuth links: PUBLIC_URL, or derived from the request (Cloud Run is HTTPS)."""
+    if config.settings.public_url:
+        return config.settings.public_url.rstrip("/")
+    host = request.headers.get("host") or request.url.netloc
+    local = host.startswith(("localhost", "127.0.0.1"))
+    proto = "http" if local else "https"
+    return f"{proto}://{host}"
 
 
 @app.get("/health")
@@ -45,336 +54,132 @@ async def health():
 @app.post("/webhook")
 async def telegram_webhook(request: Request, body: dict):
     secret = request.headers.get("X-Telegram-Bot-Api-Secret-Token", "")
-    if settings.telegram_webhook_secret and secret != settings.telegram_webhook_secret:
+    if config.settings.telegram_webhook_secret and secret != config.settings.telegram_webhook_secret:
         log.warning("Telegram webhook received invalid secret token")
         return {"ok": False}
-
-    msg = body.get("message", {})
-    chat_id = msg.get("chat", {}).get("id")
-    text = (msg.get("text") or "").strip()
-    if not chat_id or not text:
-        return {"ok": True}
-
-    # Save chat_id on /start (but don't overwrite existing one)
-    if text == "/start":
-        s_start = await get_settings()
-        if s_start.telegram_chat_id and s_start.telegram_chat_id != chat_id:
-            await send_message(
-                settings.telegram_bot_token,
-                chat_id,
-                "This bot is already configured for another user.",
-            )
-            return {"ok": True}
-        s_start.telegram_chat_id = chat_id
-        await save_settings(s_start)
-        await send_message(
-            settings.telegram_bot_token,
-            chat_id,
-            "Hello! I'm Lola, your AI personal assistant.\n\n"
-            "/status — current state\n"
-            "/drafts — pending email drafts\n"
-            "/rewrite <n> <context> — update a draft\n"
-            "/raw <text> — analyze text\n"
-            "/chat <question> — ask about your state\n"
-            "/help — all commands",
-        )
-        return {"ok": True}
-
-    # Check if this chat has any accounts (fall back to owner's accounts for backward compat)
-    s = await get_settings()
-    is_owner = chat_id == s.telegram_chat_id
-    my_accounts = await list_accounts(chat_id=chat_id)
-    if my_accounts:
-        account_emails = [a.email for a in my_accounts]
-    elif is_owner:
-        my_accounts = await list_accounts()
-        account_emails = None
-    else:
-        await send_message(
-            settings.telegram_bot_token, chat_id, "No accounts linked to this chat."
-        )
-        return {"ok": True}
-
-    def filter_by_account(items: list[dict]) -> list[dict]:
-        if account_emails is None:
-            return items
-        return [i for i in items if i.get("account") in account_emails]
-
-    if text == "/status":
-        drafts = filter_by_account(await get_pending_drafts())
-        promises = filter_by_account(await get_open_promises())
-        draft_text = f"{len(drafts)} pending drafts" if drafts else "no pending drafts"
-        promise_text = f"{len(promises)} open promises" if promises else "no open promises"
-        state = await get_state()
-        last_run = state.last_run.strftime("%b %d %H:%M") if state.last_run else "never"
-        msg_text = f"📋 Status\n\n📧 {draft_text}\n⚠️ {promise_text}\n🕐 Last check: {last_run}"
-        await send_message(settings.telegram_bot_token, chat_id, msg_text)
-        return {"ok": True}
-
-    if text.startswith("/drafts"):
-        drafts = filter_by_account(await get_pending_drafts())
-        if not drafts:
-            await send_message(settings.telegram_bot_token, chat_id, "No pending drafts.")
-            return {"ok": True}
-        lines = []
-        for i, d in enumerate(drafts, 1):
-            to_esc = escape_markdown(d.get("to", "?"))
-            subj_esc = escape_markdown(d.get("subject", "?"))
-            body_preview = escape_markdown(d.get("body", "")[:80].replace("\n", " "))
-            lines.append(f"{i}. To: {to_esc} — \"{subj_esc}\"")
-            lines.append(f"   {body_preview}...")
-        entries = "\n".join(lines)
-        await send_message(
-            settings.telegram_bot_token,
-            chat_id,
-            f"📧 Pending drafts:\n\n{entries}\n\nUse /rewrite N <context> to update a draft.",
-        )
-        return {"ok": True}
-
-    if text.startswith("/rewrite"):
-        parts = text.split(maxsplit=2)
-        if len(parts) < 3:
-            await send_message(settings.telegram_bot_token, chat_id, "Usage: /rewrite N <new context>")
-            return {"ok": True}
-        try:
-            idx = int(parts[1]) - 1
-        except ValueError:
-            await send_message(settings.telegram_bot_token, chat_id, "N must be a number")
-            return {"ok": True}
-        context = parts[2]
-
-        drafts_list = filter_by_account(await get_pending_drafts())
-        if idx < 0 or idx >= len(drafts_list):
-            await send_message(settings.telegram_bot_token, chat_id, "Draft number out of range")
-            return {"ok": True}
-
-        draft = drafts_list[idx]
-        result = await rewrite_draft(
-            to=draft["to"],
-            subject=draft["subject"],
-            body=draft["body"],
-            context=context,
-            api_key=settings.deepseek_api_key,
-            api_url=settings.deepseek_api_url,
-            signature=settings.signature,
-        )
-        if not result:
-            await send_message(settings.telegram_bot_token, chat_id, "Failed to rewrite draft.")
-            return {"ok": True}
-
-        new_subject = result.get("subject", draft["subject"])
-        new_body = result.get("body", draft["body"])
-
-        await update_draft(draft["id"], {"subject": new_subject, "body": new_body})
-
-        for acc in my_accounts:
-            if acc.email == draft.get("account"):
-                await asyncio.to_thread(
-                    create_draft,
-                    account=acc,
-                    client_id=settings.google_client_id,
-                    client_secret=settings.google_client_secret,
-                    to=draft["to"],
-                    subject=new_subject,
-                    body=new_body,
-                    thread_id=draft.get("thread_id"),
-                )
-
-        await send_message(settings.telegram_bot_token, chat_id, f"✅ Draft updated with new context.")
-        return {"ok": True}
-
-    if text.startswith("/raw"):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            await send_message(settings.telegram_bot_token, chat_id, "Usage: /raw <text>")
-            return {"ok": True}
-        raw_text = parts[1]
-        response = await answer_question(
-            question=f"Analyze this text. What action items, promises, or questions are in it?\n\n{raw_text}",
-            drafts_summary="",
-            promises_summary="",
-            last_activity="",
-            api_key=settings.deepseek_api_key,
-            api_url=settings.deepseek_api_url,
-            signature=settings.signature,
-        )
-        await send_message(settings.telegram_bot_token, chat_id, response)
-        return {"ok": True}
-
-    if text.startswith("/chat"):
-        parts = text.split(maxsplit=1)
-        if len(parts) < 2:
-            await send_message(settings.telegram_bot_token, chat_id, "Usage: /chat <question>")
-            return {"ok": True}
-        question = parts[1]
-        drafts = filter_by_account(await get_pending_drafts())
-        promises = filter_by_account(await get_open_promises())
-        state = await get_state()
-        response = await answer_question(
-            question=question,
-            drafts_summary=str(len(drafts)) if drafts else "none",
-            promises_summary="\n".join(f"- {escape_markdown(p.get('text', ''))}" for p in promises[:5]) if promises else "none",
-            last_activity=state.last_run.strftime("%b %d %H:%M") if state.last_run else "never",
-            api_key=settings.deepseek_api_key,
-            api_url=settings.deepseek_api_url,
-            signature=settings.signature,
-        )
-        await send_message(settings.telegram_bot_token, chat_id, response)
-        return {"ok": True}
-
-    if text == "/help":
-        await send_message(
-            settings.telegram_bot_token,
-            chat_id,
-            "/status — current state\n"
-            "/drafts — pending drafts\n"
-            "/rewrite N <context> — update draft\n"
-            "/raw <text> — analyze text\n"
-            "/chat <question> — ask about state",
-        )
-        return {"ok": True}
-
-    await send_message(settings.telegram_bot_token, chat_id, f"Unknown command: {text}\nUse /help")
+    try:
+        await handle_update(body, public_base_url(request))
+    except Exception as exc:  # noqa: BLE001 — return 200 so Telegram doesn't retry forever
+        log.error("Error handling update: %s", exc, exc_info=True)
+        chat_id = (body.get("message") or {}).get("chat", {}).get("id")
+        if chat_id:
+            try:
+                await reply(chat_id, "😵 Sorry, something went wrong. Please try again later.")
+            except Exception:  # noqa: BLE001
+                pass
     return {"ok": True}
 
 
 @app.post("/run")
 async def scheduled_run(request: Request):
     secret = request.headers.get("X-Run-Secret", "")
-    if settings.run_secret and secret != settings.run_secret:
+    if config.settings.run_secret and secret != config.settings.run_secret:
         log.warning("Scheduled run received invalid secret token")
         return {"status": "unauthorized"}
-    await _process_accounts()
-    return {"status": "ok"}
+    stats = await run_all_users()
+    return {"status": "ok", **(stats or {})}
 
 
-async def _process_accounts():
-    log.info("Starting scheduled run...")
-    
-    state = await get_state()
-    settings_model = await get_settings()
-
-    all_email_items: list[str] = []
-    all_chat_items: list[str] = []
-    all_promises: list[Promise] = []
-    total_drafts = 0
-
-    accounts = await list_accounts()
-
-    for account in accounts:
-        log.info("Processing account: %s", account.email)
-        if not account.enabled:
-            continue
-
-        try:
-            # --- Gmail ---
-            if "gmail" in account.providers:
-                log.info("Fetching emails for %s...", account.email)
-                messages = await asyncio.to_thread(
-                    fetch_recent_messages,
-                    account=account,
-                    client_id=settings.google_client_id,
-                    client_secret=settings.google_client_secret,
-                    last_run=state.last_run,
-                )
-                if messages:
-                    log.info("Analyzing %d emails...", len(messages))
-                    result = await analyze_emails(
-                        messages=messages,
-                        account=account.email,
-                        api_key=settings.deepseek_api_key,
-                        api_url=settings.deepseek_api_url,
-                        signature=settings.signature,
-                    )
-                    for draft in result.drafts:
-                        draft_data = draft.model_dump()
-                        draft_id = await save_draft(draft_data)
-                        gmail_draft_id = await asyncio.to_thread(
-                            create_draft,
-                            account=account,
-                            client_id=settings.google_client_id,
-                            client_secret=settings.google_client_secret,
-                            to=draft.to,
-                            subject=draft.subject,
-                            body=draft.body,
-                            thread_id=draft.thread_id,
-                        )
-                        if gmail_draft_id:
-                            await update_draft(draft_id, {"gmail_draft_id": gmail_draft_id})
-                            log.info("Created draft: %s -> %s", draft.subject, draft.to)
-                            total_drafts += 1
-                        else:
-                            log.error("Failed to create Gmail draft: %s -> %s", draft.subject, draft.to)
-
-                    for p in result.promises:
-                        p_data = p.model_dump()
-                        p_data["account"] = account.email
-                        await save_promise(p_data)
-                        all_promises.append(p)
-
-                    all_email_items.extend(result.summary_items)
-
-            # --- Google Chat ---
-            if "chat" in account.providers:
-                log.info("Fetching chat spaces for %s...", account.email)
-                spaces = await asyncio.to_thread(
-                    list_spaces,
-                    account=account,
-                    client_id=settings.google_client_id,
-                    client_secret=settings.google_client_secret,
-                )
-                for space in spaces:
-                    log.info("Fetching messages from %s...", space.get("displayName", space["name"]))
-                    messages = await asyncio.to_thread(
-                        fetch_messages,
-                        account=account,
-                        client_id=settings.google_client_id,
-                        client_secret=settings.google_client_secret,
-                        space=space,
-                        last_run=state.last_run,
-                    )
-                    if messages:
-                        log.info("Analyzing %d chat messages...", len(messages))
-                        result = await analyze_chat(
-                            messages=messages,
-                            space_name=space.get("displayName", space["name"]),
-                            api_key=settings.deepseek_api_key,
-                            api_url=settings.deepseek_api_url,
-                        )
-                        for p in result.promises:
-                            p_data = p.model_dump()
-                            p_data["account"] = account.email
-                            await save_promise(p_data)
-                            all_promises.append(p)
-
-                        if result.missed_questions:
-                            all_chat_items.extend(result.missed_questions)
-                        all_chat_items.extend(result.summary_items)
-
-        except Exception as exc:
-            log.error("Error processing account %s: %s", account.email, exc, exc_info=True)
-
-    # Compose and send summary
-    promises_text = "\n".join(f"- {escape_markdown(p.text)}" for p in all_promises[:10]) if all_promises else "none"
-    email_text = "\n".join(f"- {escape_markdown(item)}" for item in all_email_items[:10]) if all_email_items else "no new emails"
-    chat_text = "\n".join(f"- {escape_markdown(item)}" for item in all_chat_items[:10]) if all_chat_items else "no new chat activity"
-
-    date_str = datetime.now(timezone.utc).strftime("%b %d, %Y")
-    summary = await compose_summary(
-        email_summary=email_text,
-        chat_summary=chat_text,
-        promises=promises_text,
-        date=date_str,
-        api_key=settings.deepseek_api_key,
-        api_url=settings.deepseek_api_url,
-        signature=settings.signature,
+# ---------------------------------------------------------------- OAuth pages
+def _page(title: str, body_html: str, status_code: int = 200) -> HTMLResponse:
+    return HTMLResponse(
+        f"""<!doctype html><html><head><meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<meta name="referrer" content="no-referrer">
+<title>{html.escape(title)}</title>
+<style>body{{font-family:system-ui,sans-serif;max-width:520px;margin:48px auto;padding:0 16px;line-height:1.5}}
+.btn{{display:inline-block;background:#1a73e8;color:#fff;padding:12px 20px;border-radius:6px;text-decoration:none}}
+.warn{{background:#fff4e5;padding:12px;border-radius:6px}}</style></head>
+<body><h2>{html.escape(title)}</h2>{body_html}</body></html>""",
+        status_code=status_code,
+        headers={"Cache-Control": "no-store"},
     )
 
-    if settings_model.telegram_chat_id:
-        await send_message(settings.telegram_bot_token, settings_model.telegram_chat_id, summary)
-        log.info("Summary sent to Telegram")
-    else:
-        log.info("No Telegram chat_id configured. Run /start from your bot first.")
 
-    await save_state(GlobalState(last_run=datetime.now(timezone.utc)))
-    log.info("Scheduled run complete. Created %d drafts.", total_drafts)
+EXPIRED_PAGE = "<p>This link is invalid or has expired. Send <b>/connect</b> to the bot to get a new one.</p>"
+
+
+@app.get("/oauth/start")
+async def oauth_start(state: str = ""):
+    """Confirmation page shown before redirecting to Google.
+
+    Shows *which Telegram user* the Google account will be linked to, so a person
+    who received a forwarded link doesn't unknowingly hand their mailbox to someone else.
+    """
+    store = get_store()
+    oauth_state = await store.get_oauth_state(state)
+    if oauth_state is None:
+        return _page("Link expired", EXPIRED_PAGE, 400)
+    user = await store.get_user(oauth_state.user_id)
+    if user is None or not user.is_active:
+        return _page("Link expired", EXPIRED_PAGE, 400)
+    url = build_auth_url(config.settings.google_client_id, oauth_state.redirect_uri, oauth_state.id, oauth_state.code_verifier)
+    who = html.escape(user.display_name)
+    return _page(
+        "Connect your Google account",
+        f"""<p>You are about to give <b>Lola</b> access to the Gmail and Google Chat of the Google
+account you choose next. Summaries and drafts will be delivered to the Telegram user
+<b>{who}</b>.</p>
+<p class="warn">⚠️ Continue only if <b>{who}</b> is <b>your own</b> Telegram account.
+If somebody sent you this link, close this page.</p>
+<p><a class="btn" href="{html.escape(url)}">Continue with Google</a></p>""",
+    )
+
+
+@app.get("/oauth/callback")
+async def oauth_callback(state: str = "", code: str = "", error: str = ""):
+    s = config.settings
+    store = get_store()
+    oauth_state = await store.consume_oauth_state(state)
+    if oauth_state is None:
+        return _page("Link expired", EXPIRED_PAGE, 400)
+    user = await store.get_user(oauth_state.user_id)
+    if user is None or not user.is_active:
+        return _page("Link expired", EXPIRED_PAGE, 400)
+
+    if error or not code:
+        await reply(user.chat_id, "Google sign-in was cancelled. Send /connect to try again.")
+        return _page("Cancelled", "<p>Google sign-in was cancelled. You can close this window.</p>")
+
+    try:
+        tokens = await exchange_code(code, s.google_client_id, s.google_client_secret, oauth_state.redirect_uri, oauth_state.code_verifier)
+        claims = parse_id_token(tokens.get("id_token", ""), s.google_client_id)
+    except OAuthError as exc:
+        log.error("OAuth callback failed for user %s: %s", user.id, exc)
+        await reply(user.chat_id, "❌ Could not link the Google account. Send /connect to try again.")
+        return _page("Something went wrong", "<p>Could not complete Google sign-in. Please try again from Telegram.</p>", 400)
+
+    email = (claims.get("email") or "").lower()
+    refresh_token = tokens.get("refresh_token", "")
+    providers = providers_from_scopes(tokens.get("scope", ""))
+
+    if not email or not claims.get("email_verified", False):
+        problem = "Google did not return a verified email address."
+    elif not refresh_token:
+        problem = "Google did not return offline access. Remove Lola at myaccount.google.com/permissions and try again."
+    elif not providers:
+        problem = "No Gmail or Chat permissions were granted. Please tick the permission checkboxes."
+    else:
+        problem = ""
+    # NB: never revoke the new token on failure paths — revocation kills the whole grant
+    # for that Google account, including a valid token an existing link may rely on.
+    if problem:
+        await reply(user.chat_id, f"❌ {escape_markdown(problem)} Send /connect to try again.")
+        return _page("Account not linked", f"<p>{html.escape(problem)}</p>", 400)
+
+    result = await store.link_account(Account(email=email, user_id=user.id, refresh_token=refresh_token, providers=providers))
+    if result == LinkResult.TAKEN:
+        await reply(user.chat_id, f"❌ {escape_markdown(email)} is already linked to another user.")
+        return _page("Account not linked", f"<p>{html.escape(email)} is already linked to another user of this bot.</p>", 409)
+
+    missing = [p for p in ("gmail", "chat") if p not in providers]
+    note = f"\n(No access granted for: {', '.join(missing)})" if missing else ""
+    verb = "reconnected" if result == LinkResult.UPDATED else "connected"
+    await reply(
+        user.chat_id,
+        f"✅ {escape_markdown(email)} {verb}.{note}\n\nYou'll get your summary at the next scheduled run. /accounts shows linked accounts.",
+    )
+    return _page(
+        "Account connected ✅",
+        f"<p><b>{html.escape(email)}</b> is now linked. You can close this window and return to Telegram.</p>",
+    )

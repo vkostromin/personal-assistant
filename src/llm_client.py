@@ -1,6 +1,8 @@
 import json
 import logging
+from dataclasses import dataclass
 from datetime import datetime
+from typing import Awaitable, Callable
 
 import httpx
 
@@ -10,49 +12,84 @@ from src.prompts import ANALYZE_CHAT, ANALYZE_EMAILS, ANSWER_QUESTION, COMPOSE_S
 from src.models import ChatSummary, Draft, EmailSummary, Promise
 
 
-async def _call(
-    messages: list[dict],
-    api_key: str,
-    api_url: str,
-    model: str = "deepseek-v4-flash",
-    response_format: dict | None = None,  # kept for signature compat, not sent
-) -> str:
+class LLMError(RuntimeError):
+    """Provider returned an error (bad key, quota, model not found, outage...)."""
+
+    def __init__(self, message: str, status: int | None = None):
+        super().__init__(message)
+        self.status = status
+
+
+@dataclass(frozen=True)
+class LLMConfig:
+    provider: str
+    model: str
+    url: str
+    api_key: str
+    own_key: bool = False  # user's personal key (no limits) vs the shared server key
+
+
+async def chat_completion(config: LLMConfig, messages: list[dict], max_tokens: int = 8000) -> tuple[str, int]:
+    """OpenAI-compatible chat completion. Returns (content, total tokens used)."""
+    payload: dict = {
+        "model": config.model,
+        "messages": messages,
+        "temperature": 0.1,
+        "max_tokens": max_tokens,
+    }
     try:
-        payload: dict = {
-            "model": model,
-            "messages": messages,
-            "temperature": 0.1,
-            "max_tokens": 8000,
-        }
-        # response_format omitted — not supported by all endpoints
         async with httpx.AsyncClient(timeout=60) as client:
             resp = await client.post(
-                api_url,
-                headers={"Authorization": f"Bearer {api_key}", "Content-Type": "application/json"},
+                config.url,
+                headers={"Authorization": f"Bearer {config.api_key}", "Content-Type": "application/json"},
                 json=payload,
             )
             resp.raise_for_status()
             data = resp.json()
-            msg = data["choices"][0]["message"]
-            return msg.get("content") or ""
     except httpx.HTTPStatusError as e:
-        raise RuntimeError(f"LLM API error {e.response.status_code}: {e.response.text[:200]}") from e
+        raise LLMError(
+            f"{config.provider} API error {e.response.status_code}: {e.response.text[:200]}", e.response.status_code
+        ) from e
+    except httpx.HTTPError as e:
+        raise LLMError(f"{config.provider} API unreachable: {e}") from e
+    content = data["choices"][0]["message"].get("content") or ""
+    tokens = (data.get("usage") or {}).get("total_tokens")
+    if not tokens:  # provider didn't report usage: rough estimate (~4 chars per token)
+        tokens = (sum(len(m["content"]) for m in messages) + len(content)) // 4
+    return content, int(tokens)
 
 
-async def analyze_emails(
-    messages: list[dict], account: str, api_key: str, api_url: str, signature: str
-) -> EmailSummary:
+UsageHook = Callable[[int], Awaitable[None]]
+CheckHook = Callable[[], Awaitable[None]]
+
+
+class LLM:
+    """An LLM bound to one provider/key, with optional quota check and usage recording."""
+
+    def __init__(self, config: LLMConfig, before_call: CheckHook | None = None, on_usage: UsageHook | None = None):
+        self.config = config
+        self._before_call = before_call
+        self._on_usage = on_usage
+
+    async def complete(self, messages: list[dict], essential: bool = False, max_tokens: int = 8000) -> str:
+        """``essential`` calls (the digest itself) skip the quota check but are still counted."""
+        if self._before_call and not essential:
+            await self._before_call()
+        content, tokens = await chat_completion(self.config, messages, max_tokens=max_tokens)
+        if self._on_usage:
+            await self._on_usage(tokens)
+        return content
+
+
+async def analyze_emails(messages: list[dict], account: str, llm: LLM, signature: str) -> EmailSummary:
     formatted = "\n---\n".join(
         f"From: {m['from']}\nSubject: {m['subject']}\nDate: {m['date']}\nBody:\n{m['body'][:1000]}"
         for m in messages
     )
     prompt = ANALYZE_EMAILS.format(account=account, emails=formatted, signature=signature)
-    content = await _call(
+    content = await llm.complete(
         [{"role": "system", "content": "You are Lola, an AI personal assistant. Respond only in valid JSON."},
          {"role": "user", "content": prompt}],
-        api_key,
-        api_url,
-        response_format={"type": "json_object"},
     )
     log.info("analyze_emails raw: %s", content[:300])
     content = _clean_json(content)
@@ -87,19 +124,14 @@ async def analyze_emails(
     return EmailSummary(drafts=drafts, promises=promises, summary_items=data.get("summary_items", []))
 
 
-async def analyze_chat(
-    messages: list[dict], space_name: str, api_key: str, api_url: str
-) -> ChatSummary:
+async def analyze_chat(messages: list[dict], space_name: str, llm: LLM) -> ChatSummary:
     formatted = "\n".join(
         f"[{m['time'][:16]}] {m['sender']}: {m['text']}" for m in messages
     )
     prompt = ANALYZE_CHAT.format(space_name=space_name, messages=formatted)
-    content = await _call(
+    content = await llm.complete(
         [{"role": "system", "content": "You are Lola, an AI personal assistant. Respond only in valid JSON."},
          {"role": "user", "content": prompt}],
-        api_key,
-        api_url,
-        response_format={"type": "json_object"},
     )
     content = _clean_json(content)
     try:
@@ -126,16 +158,11 @@ async def analyze_chat(
     )
 
 
-async def rewrite_draft(
-    to: str, subject: str, body: str, context: str, api_key: str, api_url: str, signature: str
-) -> dict | None:
+async def rewrite_draft(to: str, subject: str, body: str, context: str, llm: LLM, signature: str) -> dict | None:
     prompt = REWRITE_DRAFT.format(to=to, subject=subject, body=body, context=context, signature=signature)
-    content = await _call(
+    content = await llm.complete(
         [{"role": "system", "content": "You are Lola, an AI personal assistant. Respond only in valid JSON."},
          {"role": "user", "content": prompt}],
-        api_key,
-        api_url,
-        response_format={"type": "json_object"},
     )
     content = _clean_json(content)
     try:
@@ -149,8 +176,7 @@ async def answer_question(
     drafts_summary: str,
     promises_summary: str,
     last_activity: str,
-    api_key: str,
-    api_url: str,
+    llm: LLM,
     signature: str,
 ) -> str:
     prompt = ANSWER_QUESTION.format(
@@ -160,11 +186,9 @@ async def answer_question(
         last_activity=last_activity,
         signature=signature,
     )
-    return await _call(
+    return await llm.complete(
         [{"role": "system", "content": "You are Lola, an AI personal assistant. Respond concisely."},
          {"role": "user", "content": prompt}],
-        api_key,
-        api_url,
     )
 
 
@@ -173,8 +197,7 @@ async def compose_summary(
     chat_summary: str,
     promises: str,
     date: str,
-    api_key: str,
-    api_url: str,
+    llm: LLM,
     signature: str,
 ) -> str:
     prompt = COMPOSE_SUMMARY.format(
@@ -184,11 +207,10 @@ async def compose_summary(
         date=date,
         signature=signature,
     )
-    return await _call(
+    return await llm.complete(
         [{"role": "system", "content": "You are Lola, an AI personal assistant. Compose a concise summary."},
          {"role": "user", "content": prompt}],
-        api_key,
-        api_url,
+        essential=True,  # the digest is always delivered, even when the limit is used up
     )
 
 
