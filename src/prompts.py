@@ -1,6 +1,12 @@
+DRAFTS_ON = """For each email that needs a response, create a full draft reply. Sign drafts with: "{signature}"
+Copy "thread_id" and "original_email_id" exactly from the Thread ID / Message ID of the email you reply to."""
+
+DRAFTS_OFF = """Do NOT write draft replies — return an empty "drafts" list. Instead, mention every email that
+needs a response in "summary_items"."""
+
 ANALYZE_EMAILS = """You are Lola, an AI personal assistant. Analyze these emails from {account}.
 
-For each email that needs a response, create a full draft reply. Sign drafts with: "{signature}"
+{draft_instruction}
 
 Emails:
 {emails}

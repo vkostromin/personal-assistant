@@ -36,14 +36,19 @@ GCP Console → APIs & Services → OAuth consent screen (Google Auth Platform):
   - *Internal*: all users are in your Google Workspace organisation. No verification, no expiry.
   - *External + Testing*: add every user's Gmail address under **Test users** (max 100).
 
-### 4. Deploy Cloud Run (first time)
+### 4. Get an AI key
+Set **one** of `GEMINI_API_KEY` (recommended), `DEEPSEEK_API_KEY`, `OPENAI_API_KEY` in `.env` —
+the first one set (in that order) is used for everybody without their own key.
+See [AI providers and limits](#ai-providers-and-limits).
+
+### 5. Deploy Cloud Run (first time)
 ```bash
 cp .env.example .env   # fill in the values; PUBLIC_URL can stay empty for now
 make deploy
 gcloud run services describe personal-assistant --region=us-central1 --format='value(status.url)'
 ```
 
-### 5. Create a **Web application** OAuth client
+### 6. Create a **Web application** OAuth client
 GCP Console → APIs & Services → Credentials → Create OAuth client ID → **Web application**
 - Authorized redirect URI: `https://<your-service-url>/oauth/callback`
 - Put the client ID/secret in `.env` as `GOOGLE_CLIENT_ID` / `GOOGLE_CLIENT_SECRET`
@@ -55,7 +60,7 @@ GCP Console → APIs & Services → Credentials → Create OAuth client ID → *
 make deploy   # redeploy with the new client + PUBLIC_URL
 ```
 
-### 6. Set Telegram webhook and scheduler
+### 7. Set Telegram webhook and scheduler
 ```bash
 make setup-telegram
 gcloud scheduler jobs create http lola-run --location=us-central1 \
@@ -65,7 +70,7 @@ gcloud scheduler jobs create http lola-run --location=us-central1 \
 make setup-firestore-ttl   # optional: auto-clean expired sign-in links
 ```
 
-### 7. Become the admin
+### 8. Become the admin
 Open the bot in Telegram and send `/start`. On a fresh deployment **the first user becomes the admin**
 (set `ADMIN_TELEGRAM_ID` to restrict this to your Telegram user id). Tap **Connect Google account**,
 confirm, sign in with Google — done.
@@ -85,51 +90,56 @@ will be linked to, to protect people from "please click this link" phishing.
 ### Commands
 | Everyone | Admin only |
 |----------|------------|
-| `/status`, `/drafts`, `/rewrite N <context>`, `/raw <text>`, `/chat <question>` | `/invite [note]`, `/invites`, `/revoke <code>` |
+| `/status`, `/drafts`, `/rewrite N <context>` (updates the Gmail draft in place), `/raw <text>`, `/chat <question>` | `/invite [note]`, `/invites`, `/revoke <code>` |
 | `/connect`, `/accounts`, `/disconnect <email>` (revokes Google access) | `/users`, `/disable <id>`, `/enable <id>` |
-| `/llm`, `/setkey <provider> <key> [model]`, `/removekey` | `/remove <id>` — deletes the user, their accounts (tokens revoked), drafts and promises |
-| `/help` | `/setlimit <id> <tokens\|default\|unlimited>` — e.g. `/setlimit 12345 300k` |
-
-`/rewrite` edits the existing Gmail draft in place (it only creates a new one if the original was
-sent or deleted in Gmail).
+| `/usage` — AI provider, usage and limits | `/remove <id>` — deletes the user, their accounts (tokens revoked), drafts, promises, AI key |
+| `/setkey <provider> <key> [model]`, `/removekey` — own AI key, no limits | |
+| `/help` | |
 
 If a user's Google access is revoked or expires, the next summary tells them to `/connect` again.
 
-## AI providers, limits and own keys
+## AI providers and limits
 
-### Shared (server) provider
-The server uses the **first provider in `LLM_PROVIDER_ORDER` (default `gemini,deepseek,openai`) whose
-key is set**: `GEMINI_API_KEY`, `DEEPSEEK_API_KEY` (+ `DEEPSEEK_API_URL`, `DEEPSEEK_MODEL`),
-`OPENAI_API_KEY`. Models: `GEMINI_MODEL` (default `gemini-2.5-flash-lite`), `OPENAI_MODEL`.
+### Shared key
+The server uses the **first** provider that has a key: `GEMINI_API_KEY` → `DEEPSEEK_API_KEY` →
+`OPENAI_API_KEY`. All are called through their OpenAI-compatible chat API.
 
-Recommended: **Gemini 2.5 Flash-Lite** — the cheapest current Gemini model (≈ $0.10 / 1M input,
-$0.40 / 1M output tokens; check current pricing), fast, no "thinking" by default, and good enough for
-triage, summaries and short replies. If draft quality isn't good enough, switch to `gemini-2.5-flash`
-(≈ 3× input / 6× output price; it "thinks" by default, so it's slower and uses more tokens).
+Recommended: **Gemini 2.5 Flash-Lite** (`gemini-2.5-flash-lite`, the default) — the cheapest current
+Gemini model, fast, no "thinking" by default, 1M context; good enough for triage, promises and short
+replies. If drafts feel too plain, set `GEMINI_MODEL=gemini-2.5-flash` (smarter, roughly 3–6× the
+price, slower). The same models are on Vertex AI at the same price; the Gemini API key route is
+simply the least setup. Check current prices at ai.google.dev/pricing.
 
-Create the key in Google AI Studio (aistudio.google.com/apikey) **in a project with billing enabled** —
-on the free tier Google may use prompts (i.e. your users' emails) to improve its products; on the paid
-tier it doesn't.
+> ⚠️ Enable billing on the Google project that owns the Gemini key. On the free tier Google may use
+> prompts and responses (here: your users' emails) to improve its products; on the paid tier it doesn't.
 
-### Per-user limit
-Users of the shared key get `USER_TOKEN_LIMIT` tokens (prompt + completion, default **150 000**) per
-12-hour period. The period restarts at every scheduled run (and at the latest after 12h).
-Sizing: an email costs ≈ 300–600 prompt tokens (body truncated to 1 000 chars; non-Latin scripts
-cost more) plus ≈ 100–300 tokens of draft — ~100 emails ≈ 60–90k tokens; chat spaces, the digest and a
-few `/chat` or `/rewrite` calls fit in the rest. Worst case with Flash-Lite ≈ $0.03 per user per 12h.
+### Per-user limits (shared key)
+A usage window lasts 12 hours and restarts with each scheduled run.
+| Limit | Default | What happens |
+|-------|---------|--------------|
+| `USER_EMAIL_LIMIT` | 100 emails / window | newest 100 are analysed; the summary says how many were skipped |
+| `USER_TOKEN_LIMIT` | 150 000 tokens / window | ~100 emails with drafts + chat + summary take ~60–90k; the rest is for `/rewrite`, `/chat`, `/raw`. When used up, **draft replies and those commands pause until the next run**; summaries continue |
 
-When the limit is used up:
-- during the run: remaining mail/chat isn't analyzed and no drafts are written; it is **not lost** — it's
-  picked up at the next run. The digest is always sent and says the limit was reached;
-- `/rewrite`, `/chat`, `/raw` reply that the limit is reached until the next run.
+Admins aren't limited (`LIMIT_ADMINS=true` to change that). Users see their numbers with `/usage`.
+Rough cost on Gemini 2.5 Flash-Lite: a fully used window is ≈ $0.03, so ≤ ~$2 per user per month at
+the limit, typically far less.
 
-Admins are never limited. The admin can change one user's limit with `/setlimit`.
+### Own key
+`/setkey gemini|deepseek|openai <key> [model]` — the bot deletes the message, tests the key, and
+stores it encrypted. That user then has no token limit (the email cap becomes
+`MAX_EMAILS_PER_RUN`=200 — a technical cap so a run fits the 300 s request timeout) and pays their
+own provider. `/removekey` goes back to the shared key.
 
-### Own API key (no limits)
-`/setkey <gemini|deepseek|openai> <api key> [model]` — the key is checked with a tiny test request,
-stored encrypted (`TOKEN_ENCRYPTION_KEY`), and the message with the key is deleted from the chat.
-From then on the user's own key is used for everything, without limits. `/removekey` goes back to the
-shared provider. `/llm` shows the current provider and usage.
+## Scaling
+
+Cloud Run: max 3 instances, concurrency 10, 300 s timeout. A scheduled run processes 3 users in
+parallel and stops starting new AI work after `RUN_TIME_BUDGET_SECONDS` (240 s); anything left is
+reported in the summary. That comfortably fits a few dozen users per run. Beyond that, split users
+over several scheduler jobs — each gets its own request/instance:
+```bash
+# 3 jobs: ...&shard=0, 1, 2 (users are split by user_id % shards)
+--uri="$URL/run?shard=0&shards=3"
+```
 
 ## Upgrading an existing single-user deployment
 
@@ -144,14 +154,7 @@ Then:
    client stop working with the new client. **Send `/connect` and sign in again for each existing
    account.** Until you do, the summary shows a "🔑 … send /connect" reminder for it.
 3. `scripts/auth.py` / `make auth` are gone — accounts are only linked via Telegram now.
-
-## Capacity
-
-Cloud Run: max 3 instances, concurrency 10, **300 s timeout**. `/run` processes all users in one request,
-`RUN_CONCURRENCY` (5) users in parallel. With a fast model a user takes roughly 15–60 s, so one run
-handles a few dozen users. After `RUN_SOFT_DEADLINE_SECONDS` (240 s) the run stops *starting* new
-users/accounts; they're processed in full at the next run (nothing is lost, and nothing is half-done
-when Cloud Run's timeout hits). Beyond that, move to a fan-out via Cloud Tasks (one request per user).
+4. Optionally switch the shared AI to Gemini: set `GEMINI_API_KEY` (it takes precedence over DeepSeek).
 
 ## Google account limits
 

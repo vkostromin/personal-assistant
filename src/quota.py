@@ -1,137 +1,98 @@
-"""Per-user LLM access.
+"""Which LLM a user gets, and the per-user limits for the shared (server) key.
 
-* A user with their own API key (/setkey) uses it without limits.
-* Everybody else uses the shared server key with a token limit per usage window.
-  The window restarts at every scheduled run (every 12h) — or lazily after
-  USAGE_WINDOW_HOURS if no run happened. When the limit is used up, optional LLM
-  features (drafting in the run, /rewrite, /chat, /raw) pause until the next run;
-  the digest itself is always sent.
-* Admins are not limited (it's their key).
+* Own key (/setkey)        -> that provider, no limits.
+* Shared key, admin        -> no limits (unless LIMIT_ADMINS=true).
+* Shared key, other users  -> USER_EMAIL_LIMIT emails analysed per window and
+  USER_TOKEN_LIMIT tokens per window. When the tokens are used up, "extras"
+  (draft replies, /rewrite, /chat, /raw) pause until the next scheduled run.
+  The summary itself keeps working.
+
+A window starts at the user's scheduled run (every 12h) and expires after
+USAGE_WINDOW_HOURS at the latest.
 """
 
+import logging
 from dataclasses import dataclass
 from datetime import datetime, timedelta
 
 from src import config
-from src.llm_client import LLM
-from src.models import User, UserLLMKey, utcnow
-from src.providers import server_llm_config, user_llm_config
+from src.llm_client import LLM, PROVIDERS, server_llm, user_llm
+from src.models import User, utcnow
 from src.state import _aware, get_store
 
-
-class QuotaExceeded(Exception):
-    pass
+log = logging.getLogger(__name__)
 
 
-class LLMUnavailable(Exception):
-    """No shared LLM key configured on the server and the user has no own key."""
+async def resolve_llm(user: User) -> LLM | None:
+    own = await get_store().get_user_llm(user.id)
+    if own and own.get("provider") in PROVIDERS and own.get("api_key"):
+        return user_llm(own["provider"], own["api_key"], own.get("model", ""))
+    return server_llm()
 
 
-def effective_limit(user: User) -> int | None:
-    """Token limit for the shared key; None = unlimited."""
-    if user.is_admin or user.token_limit == 0:
-        return None
-    if user.token_limit is not None:
-        return user.token_limit
-    limit = config.settings.user_token_limit
-    return limit if limit > 0 else None
-
-
-def _window_start(data: dict, now: datetime) -> datetime | None:
-    start = _aware(data.get("window_start"))
-    if start is None or now - start >= timedelta(hours=config.settings.usage_window_hours):
-        return None
-    return start
-
-
-async def current_usage(user_id: int) -> tuple[int, datetime | None]:
-    """Tokens used from the shared key in the current window, and when the window started."""
-    data = await get_store().get_usage(user_id)
-    start = _window_start(data, utcnow())
-    return (int(data.get("tokens", 0)), start) if start else (0, None)
-
-
-async def start_window(user_id: int) -> None:
-    """Called at the start of each scheduled run: a fresh limit for the next 12h."""
-    await get_store().reset_usage(user_id, utcnow())
-
-
-async def record_usage(user_id: int, tokens: int, own: bool) -> None:
-    store = get_store()
-    now = utcnow()
-    if _window_start(await store.get_usage(user_id), now) is None:
-        await store.reset_usage(user_id, now, tokens=0 if own else tokens, own_tokens=tokens if own else 0)
-    else:
-        await store.increment_usage(user_id, tokens, own=own)
-
-
-async def get_llm(user: User) -> LLM:
-    """LLM for ``user``: own key (unlimited) or the shared key guarded by the user's limit."""
-    own = await get_store().get_llm_key(user.id)
-    if own:
-        cfg = user_llm_config(own.provider, own.api_key, own.model)
-
-        async def record_own(tokens: int) -> None:
-            await record_usage(user.id, tokens, own=True)
-
-        return LLM(cfg, on_usage=record_own)
-
-    cfg = server_llm_config()
-    if cfg is None:
-        raise LLMUnavailable()
-    limit = effective_limit(user)
-    used, _ = await current_usage(user.id)
-    counter = {"used": used}  # local view, so a long run doesn't re-read Firestore before every call
-
-    async def check() -> None:
-        if limit is not None and counter["used"] >= limit:
-            raise QuotaExceeded()
-
-    async def record(tokens: int) -> None:
-        counter["used"] += tokens
-        await record_usage(user.id, tokens, own=False)
-
-    return LLM(cfg, before_call=check, on_usage=record)
+def is_unlimited(user: User, llm: LLM) -> bool:
+    s = config.settings
+    return llm.own_key or (user.is_admin and not s.limit_admins) or s.user_token_limit <= 0
 
 
 @dataclass
-class UsageStatus:
-    own_key: UserLLMKey | None
-    provider: str | None
-    model: str | None
-    used: int
-    limit: int | None
+class Budget:
+    unlimited: bool
+    token_limit: int
+    email_limit: int
+    tokens_used: int
+    emails_used: int
     window_start: datetime | None
 
     @property
-    def exhausted(self) -> bool:
-        return self.own_key is None and self.limit is not None and self.used >= self.limit
+    def tokens_left(self) -> int:
+        return max(0, self.token_limit - self.tokens_used)
 
     @property
-    def resets_by(self) -> datetime | None:
+    def exhausted(self) -> bool:
+        return not self.unlimited and self.tokens_used >= self.token_limit
+
+    @property
+    def resets_at(self) -> datetime | None:
         if self.window_start is None:
             return None
         return self.window_start + timedelta(hours=config.settings.usage_window_hours)
 
 
-async def usage_status(user: User) -> UsageStatus:
-    own = await get_store().get_llm_key(user.id)
-    used, start = await current_usage(user.id)
-    if own:
-        cfg = user_llm_config(own.provider, own.api_key, own.model)
-        return UsageStatus(own, cfg.provider, cfg.model, used, None, start)
-    cfg = server_llm_config()
-    return UsageStatus(
-        None, cfg.provider if cfg else None, cfg.model if cfg else None, used, effective_limit(user), start
+async def get_budget(user: User, llm: LLM) -> Budget:
+    s = config.settings
+    usage = await get_store().get_usage(user.id)
+    start = _aware(usage.get("window_start"))
+    if start is None or start + timedelta(hours=s.usage_window_hours) <= utcnow():
+        tokens, emails, start = 0, 0, None  # previous window is over
+    else:
+        tokens, emails = int(usage.get("tokens", 0)), int(usage.get("emails", 0))
+    unlimited = is_unlimited(user, llm)
+    email_limit = s.max_emails_per_run if unlimited else min(s.user_email_limit, s.max_emails_per_run)
+    return Budget(
+        unlimited=unlimited,
+        token_limit=s.user_token_limit,
+        email_limit=email_limit,
+        tokens_used=tokens,
+        emails_used=emails,
+        window_start=start,
     )
 
 
-def limit_reached_text(status: UsageStatus | None = None) -> str:
-    when = ""
-    if status and status.resets_by:
-        when = f" (at the latest {status.resets_by.strftime('%b %d %H:%M UTC')})"
+async def record_usage(user: User, llm: LLM, emails: int = 0) -> None:
+    """Persist what ``llm`` spent (also for own keys — shown in /usage)."""
+    tokens, llm.tokens_used = llm.tokens_used, 0
+    try:
+        await get_store().add_usage(user.id, tokens=tokens, emails=emails)
+    except Exception as exc:  # noqa: BLE001 — accounting must never break the feature
+        log.error("Failed to record usage for %s: %s", user.id, exc)
+
+
+def limit_message(budget: Budget) -> str:
+    when = budget.resets_at.strftime("%H:%M UTC") if budget.resets_at else "the next run"
     return (
-        "⏳ You've used your AI limit for this 12-hour period. Drafting and questions are paused "
-        f"until the next scheduled run{when}; your summaries keep coming.\n\n"
-        "Tip: add your own API key with /setkey to use Lola without limits."
+        "⏳ You've used your AI limit for this 12-hour period, so draft replies, "
+        "/rewrite, /chat and /raw are paused. Your summaries continue as usual.\n\n"
+        f"The limit resets with the next scheduled run (around {when}).\n"
+        "Want no limits? Add your own API key: /setkey"
     )

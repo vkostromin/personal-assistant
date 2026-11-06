@@ -49,21 +49,29 @@ def _extract_body(payload: dict) -> str:
 
 def fetch_recent_messages(
     account: Account, client_id: str, client_secret: str, last_run: datetime | None, max_results: int = 20
-) -> list[dict]:
+) -> tuple[list[dict], int]:
+    """Fetch up to ``max_results`` newest messages since ``last_run``.
+
+    Returns ``(messages, skipped)`` where ``skipped`` is how many more matching messages
+    exist beyond the cap (a lower bound if there are more than 500).
+    """
     service = _get_service(account, client_id, client_secret)
     query = f"after:{int(last_run.timestamp())} -in:sent -in:drafts" if last_run else "-in:sent -in:drafts"
 
     try:
-        results = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
+        # ids only — cheap; lets us report how many emails were over the limit
+        results = service.users().messages().list(userId="me", q=query, maxResults=500).execute()
     except HttpError:
-        return []
+        return [], 0
+    ids = [m["id"] for m in results.get("messages", [])]
+    take = ids[: max(0, max_results)]
 
     messages = []
-    for msg in results.get("messages", []):
+    for msg_id in take:
         full = (
             service.users()
             .messages()
-            .get(userId="me", id=msg["id"], format="full")
+            .get(userId="me", id=msg_id, format="full")
             .execute()
         )
         headers = {h["name"]: h["value"] for h in full["payload"].get("headers", [])}
@@ -71,7 +79,7 @@ def fetch_recent_messages(
 
         messages.append(
             {
-                "id": msg["id"],
+                "id": msg_id,
                 "thread_id": full.get("threadId", ""),
                 "from": headers.get("From", ""),
                 "to": headers.get("To", ""),
@@ -81,18 +89,17 @@ def fetch_recent_messages(
             }
         )
 
-    return messages
+    return messages, len(ids) - len(take)
 
 
-def _draft_resource(to: str, subject: str, body: str, thread_id: str | None) -> dict:
+def _build_message(to: str, subject: str, body: str, thread_id: str | None) -> dict:
     mime = MIMEText(body, "plain", "utf-8")
     mime["To"] = to
     mime["Subject"] = subject
-    raw = base64.urlsafe_b64encode(mime.as_bytes()).decode()
-    resource: dict = {"message": {"raw": raw}}
+    message: dict = {"raw": base64.urlsafe_b64encode(mime.as_bytes()).decode()}
     if thread_id:
-        resource["message"]["threadId"] = thread_id
-    return resource
+        message["threadId"] = thread_id
+    return message
 
 
 def create_draft(
@@ -106,43 +113,42 @@ def create_draft(
 ) -> str | None:
     service = _get_service(account, client_id, client_secret)
     try:
-        draft = service.users().drafts().create(userId="me", body=_draft_resource(to, subject, body, thread_id)).execute()
+        draft = service.users().drafts().create(
+            userId="me", body={"message": _build_message(to, subject, body, thread_id)}
+        ).execute()
         return draft.get("id")
     except HttpError as e:
         log.error("Gmail draft creation failed: %s", e)
         return None
 
 
-def update_gmail_draft(
+class DraftGone(Exception):
+    """The Gmail draft no longer exists (sent or deleted by the user)."""
+
+
+def update_draft(
     account: Account,
     client_id: str,
     client_secret: str,
-    draft_id: str | None,
+    draft_id: str,
     to: str,
     subject: str,
     body: str,
     thread_id: str | None = None,
-) -> tuple[str | None, bool]:
-    """Replace the content of an existing Gmail draft in place.
+) -> str:
+    """Replace the content of an existing Gmail draft in place. Returns the draft id.
 
-    If the draft no longer exists (sent or deleted in Gmail) or was never created,
-    a new draft is created instead. Returns ``(draft_id, created_new)``;
-    ``draft_id`` is None if Gmail rejected both operations.
+    Raises ``DraftGone`` if the draft doesn't exist any more; other API errors propagate.
     """
     service = _get_service(account, client_id, client_secret)
-    resource = _draft_resource(to, subject, body, thread_id)
-    if draft_id:
-        try:
-            draft = service.users().drafts().update(userId="me", id=draft_id, body={"id": draft_id, **resource}).execute()
-            return draft.get("id", draft_id), False
-        except HttpError as e:
-            if e.resp.status not in (400, 404):  # 404: deleted; 400: no longer a draft (sent)
-                log.error("Gmail draft update failed: %s", e)
-                return None, False
-            log.info("Gmail draft %s no longer exists, creating a new one", draft_id)
     try:
-        draft = service.users().drafts().create(userId="me", body=resource).execute()
-        return draft.get("id"), True
+        draft = service.users().drafts().update(
+            userId="me",
+            id=draft_id,
+            body={"id": draft_id, "message": _build_message(to, subject, body, thread_id)},
+        ).execute()
+        return draft.get("id", draft_id)
     except HttpError as e:
-        log.error("Gmail draft creation failed: %s", e)
-        return None, False
+        if getattr(e, "resp", None) is not None and e.resp.status == 404:
+            raise DraftGone(draft_id) from e
+        raise

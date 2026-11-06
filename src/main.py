@@ -71,12 +71,15 @@ async def telegram_webhook(request: Request, body: dict):
 
 
 @app.post("/run")
-async def scheduled_run(request: Request):
+async def scheduled_run(request: Request, shard: int = 0, shards: int = 1):
+    """Called by Cloud Scheduler. Optional ?shard=i&shards=n splits users across n jobs."""
     secret = request.headers.get("X-Run-Secret", "")
     if config.settings.run_secret and secret != config.settings.run_secret:
         log.warning("Scheduled run received invalid secret token")
         return {"status": "unauthorized"}
-    stats = await run_all_users()
+    if shards < 1 or not 0 <= shard < shards:
+        return {"status": "bad shard"}
+    stats = await run_all_users(shard=shard, shards=shards)
     return {"status": "ok", **(stats or {})}
 
 

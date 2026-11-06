@@ -38,8 +38,6 @@ class User(BaseModel):
     role: Literal["admin", "user"] = "user"
     status: Literal["active", "disabled"] = "active"
     invited_by: Optional[int] = None
-    # Shared-LLM token limit per usage window: None = default (USER_TOKEN_LIMIT), 0 = unlimited
-    token_limit: Optional[int] = None
     created_at: datetime = Field(default_factory=utcnow)
 
     @property
@@ -70,15 +68,6 @@ class Account(BaseModel):
     provider_last_run: dict[str, datetime] = {}  # per provider ("gmail"/"chat") watermark
     created_at: datetime = Field(default_factory=utcnow)
     chat_id: Optional[int] = None  # legacy field from the single-user version
-
-
-class UserLLMKey(BaseModel):
-    """A user's own LLM API key (stored encrypted in llm_keys/{user_id})."""
-
-    provider: str
-    model: str = ""
-    api_key: str
-    created_at: datetime = Field(default_factory=utcnow)
 
 
 class Invite(BaseModel):

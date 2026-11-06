@@ -36,8 +36,10 @@ async def send_message(token: str, chat_id: int, text: str, reply_markup: dict |
 
 async def delete_message(token: str, chat_id: int, message_id: int) -> bool:
     async with httpx.AsyncClient(timeout=10) as client:
-        resp = await client.post(f"{TELEGRAM_API}{token}/deleteMessage", json={"chat_id": chat_id, "message_id": message_id})
-    return resp.is_success and resp.json().get("result") is True
+        resp = await client.post(
+            f"{TELEGRAM_API}{token}/deleteMessage", json={"chat_id": chat_id, "message_id": message_id}
+        )
+        return resp.is_success
 
 
 async def get_bot_username(token: str) -> str:

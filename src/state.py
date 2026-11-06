@@ -7,9 +7,9 @@ accounts/{email}           Google account linked to exactly one user (user_id)
 drafts/{auto}              user_id, account, ... status pending|...
 promises/{auto}            user_id, account, ... status open|done
 invites/{code}             single-use invitation codes
+usage/{telegram_user_id}   LLM usage in the current window (per-user limits)
+llm_keys/{telegram_user_id} user's own LLM provider/key (encrypted) -> no limits
 oauth_states/{state}       pending "connect Google account" links (single use)
-usage/{telegram_user_id}   shared-LLM token usage in the current window
-llm_keys/{telegram_user_id} user's own LLM provider + encrypted API key
 settings/app               admin_user_id, schema_version
 settings/global, state/global   legacy single-user docs (read once by the migration)
 """
@@ -24,7 +24,7 @@ from google.cloud.firestore import FieldFilter
 
 from src import config
 from src.crypto import decrypt, encrypt
-from src.models import Account, Invite, OAuthState, User, UserLLMKey, utcnow
+from src.models import Account, Invite, OAuthState, User, utcnow
 
 log = logging.getLogger(__name__)
 
@@ -125,8 +125,8 @@ class FirestoreStore:
         for coll in ("drafts", "promises"):
             async for doc in self.db.collection(coll).where(filter=FieldFilter("user_id", "==", user_id)).stream():
                 await doc.reference.delete()
-        await self.db.collection("usage").document(str(user_id)).delete()
-        await self.db.collection("llm_keys").document(str(user_id)).delete()
+        for coll in ("llm_keys", "usage"):
+            await self.db.collection(coll).document(str(user_id)).delete()
         await self.db.collection("users").document(str(user_id)).delete()
         return accounts
 
@@ -352,35 +352,54 @@ class FirestoreStore:
         await self.db.collection("promises").document(promise_id).update({"status": "done"})
 
     # ------------------------------------------------------------ LLM usage
+    # usage/{user_id}: window_start, tokens, emails. A window starts at the user's
+    # scheduled run (or at first use after the previous window expired).
     async def get_usage(self, user_id: int) -> dict:
         doc = await self.db.collection("usage").document(str(user_id)).get()
         return doc.to_dict() if doc.exists else {}
 
-    async def reset_usage(self, user_id: int, window_start: datetime, tokens: int = 0, own_tokens: int = 0) -> None:
+    async def start_usage_window(self, user_id: int, now: datetime | None = None) -> None:
         await self.db.collection("usage").document(str(user_id)).set(
-            {"window_start": window_start, "tokens": tokens, "own_tokens": own_tokens}
+            {"window_start": now or utcnow(), "tokens": 0, "emails": 0}
         )
 
-    async def increment_usage(self, user_id: int, tokens: int, own: bool = False) -> None:
-        """Atomic increment — several requests of one user may run concurrently."""
-        field = "own_tokens" if own else "tokens"
-        await self.db.collection("usage").document(str(user_id)).set({field: firestore.Increment(tokens)}, merge=True)
+    async def add_usage(self, user_id: int, tokens: int = 0, emails: int = 0) -> None:
+        if not tokens and not emails:
+            return
+        ref = self.db.collection("usage").document(str(user_id))
+        window = timedelta(hours=config.settings.usage_window_hours)
 
-    # ------------------------------------------------------------- LLM keys
-    async def get_llm_key(self, user_id: int) -> UserLLMKey | None:
+        async def txn(transaction):
+            snap = await ref.get(transaction=transaction)
+            data = snap.to_dict() if snap.exists else {}
+            now = utcnow()
+            start = _aware(data.get("window_start"))
+            if start is None or start + window <= now:
+                data = {"window_start": now, "tokens": 0, "emails": 0}
+            data["tokens"] = int(data.get("tokens", 0)) + int(tokens)
+            data["emails"] = int(data.get("emails", 0)) + int(emails)
+            transaction.set(ref, data)
+
+        await self._run_in_transaction(txn)
+
+    # ------------------------------------------------------ personal LLM keys
+    async def get_user_llm(self, user_id: int) -> dict | None:
         doc = await self.db.collection("llm_keys").document(str(user_id)).get()
         if not doc.exists:
             return None
         data = doc.to_dict()
         data["api_key"] = decrypt(data.get("api_key", ""), config.settings.token_encryption_key)
-        return UserLLMKey(**data)
+        return data
 
-    async def set_llm_key(self, user_id: int, key: UserLLMKey) -> None:
-        data = key.model_dump()
-        data["api_key"] = encrypt(key.api_key, config.settings.token_encryption_key)
-        await self.db.collection("llm_keys").document(str(user_id)).set(data)
+    async def set_user_llm(self, user_id: int, provider: str, api_key: str, model: str) -> None:
+        await self.db.collection("llm_keys").document(str(user_id)).set({
+            "provider": provider,
+            "api_key": encrypt(api_key, config.settings.token_encryption_key),
+            "model": model,
+            "updated_at": utcnow(),
+        })
 
-    async def delete_llm_key(self, user_id: int) -> bool:
+    async def delete_user_llm(self, user_id: int) -> bool:
         ref = self.db.collection("llm_keys").document(str(user_id))
         if not (await ref.get()).exists:
             return False

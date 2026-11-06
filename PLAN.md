@@ -36,10 +36,9 @@ Cloud Run URL: see SERVICE_URL in .env
 | Decision | Choice |
 |----------|--------|
 | Deployment | Cloud Run service (scales to zero, min 0, max 3, concurrency 10, timeout 300s) |
-| LLM | First configured of `LLM_PROVIDER_ORDER` (gemini → deepseek → openai); recommended Gemini 2.5 Flash-Lite. All via OpenAI-compatible chat completions |
-| LLM limits | Shared key: `USER_TOKEN_LIMIT` tokens per user per 12h (default 150k ≈ 100 emails), window restarts at each run; admins & own keys unlimited |
-| Own keys | `/setkey provider key [model]` — validated, encrypted in `llm_keys/{user}`, message deleted |
-| LLM tokens | `max_tokens: 8000` (headroom for reasoning models) |
+| LLM | Shared: first configured of Gemini (`gemini-2.5-flash-lite`) → DeepSeek → OpenAI; per-user own key via `/setkey` |
+| LLM limits | Shared key, non-admin: 100 emails + 150k tokens per 12h window (reset each run); over the token limit drafts, /rewrite, /chat, /raw pause |
+| LLM calls | OpenAI-compatible chat API for all providers; emails analysed in batches of 20; `max_tokens` 8000 |
 | State store | Firestore (free tier: 1 GiB, 50K reads/day) |
 | Secrets | Plain env vars (no Secret Manager) — set via Cloud Build substitutions |
 | Notifications | Telegram bot (token in `.env`) |
@@ -70,40 +69,39 @@ Cloud Run URL: see SERVICE_URL in .env
 | `/rewrite N <context>` | user | Update own draft #N with new info via LLM |
 | `/raw <text>` | user | Analyze arbitrary text for action items/promises |
 | `/chat <question>` | user | Ask Lola about your current state |
+| `/usage` | user | AI provider, usage in the current window, reset time |
+| `/setkey <provider> <key> [model]` | user | Own Gemini/DeepSeek/OpenAI key (validated, encrypted, message deleted) → no limits |
+| `/removekey` | user | Back to the shared key |
 | `/help` | user | Show all commands |
-| `/llm` | user | Provider in use, usage / limit |
-| `/setkey <provider> <key> [model]` | user | Use own gemini/deepseek/openai key without limits |
-| `/removekey` | user | Back to the shared provider |
 | `/invite [note]` | admin | Create single-use invite link `t.me/<bot>?start=<code>` (72h) |
 | `/invites`, `/revoke <code>` | admin | List / cancel active invites |
 | `/users` | admin | List users |
 | `/disable <id>`, `/enable <id>` | admin | Block / unblock a user (data kept) |
 | `/remove <id>` | admin | Delete user + accounts (tokens revoked) + drafts + promises |
-| `/setlimit <id> <tokens\|default\|unlimited>` | admin | Per-user token limit override |
 
 ## Data Flow: Scheduled Run
 
-1. List active users (`users` where status=active)
-2. For each user (bounded parallelism, one failure never affects others; no new users/accounts are
-   started after the 240s soft deadline — they're processed next run):
-   - Restart the user's 12h usage window; pick own key or the shared provider
+1. List active users (`users` where status=active; optional `?shard=i&shards=n`)
+2. For each user (bounded parallelism, one failure never affects others):
+   - Start a new usage window; pick the LLM (own key or shared) and the limits
    - For each of the user's enabled accounts (skip `needs_reauth`):
-     - **Gmail**: fetch since `provider_last_run.gmail` (new account: last 12h) → LLM → Gmail drafts → save with `user_id`
-     - **Chat**: list spaces → fetch since `provider_last_run.chat` → LLM → promises / missed questions
+     - **Gmail**: newest emails since `provider_last_run.gmail` (new account: last 12h), up to the email cap →
+       LLM in batches of 20 → Gmail drafts (paused once the token budget is spent) → save with `user_id`
+     - **Chat**: spaces active since `provider_last_run.chat` (10 most recent) → LLM → promises / missed questions
+     - No new AI work after the 240 s run budget; skipped items are reported
      - Watermark advanced per provider only on success (a Chat failure doesn't re-draft old email)
      - `invalid_grant` on token refresh → `needs_reauth=true`, user told to `/connect`
-   - Limit reached mid-run → remaining analysis/drafting skipped, watermark not advanced (picked up next run)
-   - LLM composes the user's digest (always allowed; plain-text fallback if the LLM fails) → user's chat
+   - LLM composes the user's digest (plain fallback if the LLM fails) + notes (skipped emails, paused drafts, key problems) → user's chat
+   - Tokens and emails recorded in `usage/{user_id}`
 
-## Data Flow: `/rewrite N <context>`
-1. Check usage limit → LLM rewrites draft N
-2. Gmail `drafts.update` on the stored `gmail_draft_id` (new draft only if it was sent/deleted in Gmail)
-3. Firestore draft updated (text + `gmail_draft_id`) only after Gmail succeeded
+### `/rewrite N <context>`
+LLM rewrites draft N → Gmail `drafts.update` on the stored `gmail_draft_id` (same draft, no duplicates);
+if the draft is gone from Gmail (sent/deleted) or never existed, a new one is created and its id stored.
 
 ## Firestore Collections
 
 ### `users/{telegram_user_id}`
-- chat_id, name, username, role (admin/user), status (active/disabled), invited_by, token_limit (null=default, 0=unlimited), created_at
+- chat_id, name, username, role (admin/user), status (active/disabled), invited_by, created_at
 
 ### `accounts/{email}`
 - user_id, refresh_token (Fernet-encrypted), providers, enabled, needs_reauth, last_run, provider_last_run{gmail,chat}
@@ -121,10 +119,10 @@ Cloud Run URL: see SERVICE_URL in .env
 - user_id, code_verifier, redirect_uri, expires_at (optional Firestore TTL on `expires_at`)
 
 ### `usage/{telegram_user_id}`
-- window_start, tokens (shared key), own_tokens (own key, informational)
+- window_start, tokens, emails
 
 ### `llm_keys/{telegram_user_id}`
-- provider, model, api_key (Fernet-encrypted), created_at
+- provider, api_key (Fernet-encrypted), model, updated_at
 
 ### `settings/app`
 - admin_user_id, schema_version
@@ -148,10 +146,10 @@ Cloud Run URL: see SERVICE_URL in .env
 | Cloud Scheduler (1 job) | ~$0 | Free tier: 3 jobs/month |
 | Firestore (~100 reads/day) | ~$0 | Free tier: 50K reads/day |
 | Artifact Registry (1 image ~200 MB) | ~$0 | Free tier: 0.5 GB |
-| LLM, Gemini 2.5 Flash-Lite, shared key | ≤ ~$1.8/user/month | Worst case: every user uses the full 150k-token limit twice a day; typical use is far lower |
-| LLM, users with own key | $0 for the admin | Paid by the user |
+| LLM, Gemini 2.5 Flash-Lite (shared key) | ≤ ~$0.03 per user per 12h window at the limit | ≈ $0.10 / 1M input, $0.40 / 1M output tokens (verify current pricing); typical use is far below the limit |
+| LLM, own keys | $0 for the operator | billed to the user's own provider account |
 | Telegram Bot API | Free | — |
-| **Total** | **≈ LLM cost** | Infrastructure stays in free tiers for a small group |
+| **Total** | **≈ $0.3–2 per active user/month** | dominated by the shared LLM key |
 
 ## Deployment Steps (first time)
 
@@ -173,9 +171,9 @@ gcloud run services update personal-assistant --region=us-central1 --update-env-
 
 ## Switching LLM Provider
 
-Set the key of the provider you want (`GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`) and redeploy.
-The first provider in `LLM_PROVIDER_ORDER` with a key is used, e.g. to move from DeepSeek to Gemini
-just add `GEMINI_API_KEY` (Gemini comes first by default).
+The shared key is the first one set of `GEMINI_API_KEY`, `DEEPSEEK_API_KEY`, `OPENAI_API_KEY`
+(models: `GEMINI_MODEL`, `DEEPSEEK_MODEL` + `DEEPSEEK_API_URL`, `OPENAI_MODEL`). Set/unset in `.env`
+and `make deploy`. Users can override with their own key (`/setkey`).
 
 ## Adding Users / Accounts
 
@@ -189,14 +187,13 @@ src/
 ├── main.py            # FastAPI app: /webhook, /run, /oauth/start, /oauth/callback, startup migration
 ├── bot.py             # Telegram commands: registration, invites, admin, assistant
 ├── runner.py          # Scheduled per-user processing
+├── quota.py           # LLM selection (own key / shared) and per-user limits
 ├── oauth.py           # Google web OAuth (PKCE, ID token, revoke)
 ├── config.py          # Pydantic Settings (incl. deepseek_api_url)
 ├── models.py          # Pydantic models
 ├── gmail_client.py    # Gmail API (fetch max 20, create drafts)
 ├── chat_client.py     # Google Chat API (list spaces, messages)
-├── llm_client.py      # OpenAI-compatible LLM client + prompts usage (LLM object with quota hooks)
-├── providers.py       # Provider registry, server provider selection
-├── quota.py           # Per-user limits, own keys, usage windows
+├── llm_client.py      # LLM providers (Gemini/DeepSeek/OpenAI), token accounting, prompts calls
 ├── telegram_client.py # Telegram Bot API
 ├── state.py           # Firestore store (users, accounts, invites, oauth states, migration)
 └── prompts.py         # LLM prompt templates
