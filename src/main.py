@@ -9,7 +9,9 @@ from src import config
 from src.bot import handle_update, reply
 from src.models import Account
 from src.oauth import OAuthError, build_auth_url, exchange_code, parse_id_token, providers_from_scopes
+from src.reminders import run_reminders
 from src.runner import run_all_users
+from src.schedule import user_tz_name
 from src.state import LinkResult, get_store
 from src.telegram_client import escape_markdown
 
@@ -61,7 +63,8 @@ async def telegram_webhook(request: Request, body: dict):
         await handle_update(body, public_base_url(request))
     except Exception as exc:  # noqa: BLE001 — return 200 so Telegram doesn't retry forever
         log.error("Error handling update: %s", exc, exc_info=True)
-        chat_id = (body.get("message") or {}).get("chat", {}).get("id")
+        source = body.get("message") or (body.get("callback_query") or {}).get("message") or {}
+        chat_id = source.get("chat", {}).get("id")
         if chat_id:
             try:
                 await reply(chat_id, "😵 Sorry, something went wrong. Please try again later.")
@@ -71,16 +74,17 @@ async def telegram_webhook(request: Request, body: dict):
 
 
 @app.post("/run")
-async def scheduled_run(request: Request, shard: int = 0, shards: int = 1):
-    """Called by Cloud Scheduler. Optional ?shard=i&shards=n splits users across n jobs."""
+async def scheduled_run(request: Request, force: bool = False):
+    """Called hourly by Cloud Scheduler; processes users whose local 08:00/20:00 slot is due.
+    ``?force=true`` processes every active user now (manual run)."""
     secret = request.headers.get("X-Run-Secret", "")
     if config.settings.run_secret and secret != config.settings.run_secret:
         log.warning("Scheduled run received invalid secret token")
         return {"status": "unauthorized"}
-    if shards < 1 or not 0 <= shard < shards:
-        return {"status": "bad shard"}
-    stats = await run_all_users(shard=shard, shards=shards)
-    return {"status": "ok", **(stats or {})}
+    # reminders first: cheap (no LLM) and time-sensitive
+    reminder_stats = await run_reminders()
+    stats = await run_all_users(force=force)
+    return {"status": "ok", **(stats or {}), **(reminder_stats or {})}
 
 
 # ---------------------------------------------------------------- OAuth pages
@@ -170,7 +174,9 @@ async def oauth_callback(state: str = "", code: str = "", error: str = ""):
         await reply(user.chat_id, f"❌ {escape_markdown(problem)} Send /connect to try again.")
         return _page("Account not linked", f"<p>{html.escape(problem)}</p>", 400)
 
-    result = await store.link_account(Account(email=email, user_id=user.id, refresh_token=refresh_token, providers=providers))
+    result = await store.link_account(
+        Account(email=email, user_id=user.id, refresh_token=refresh_token, providers=providers, google_sub=str(claims.get("sub", "")))
+    )
     if result == LinkResult.TAKEN:
         await reply(user.chat_id, f"❌ {escape_markdown(email)} is already linked to another user.")
         return _page("Account not linked", f"<p>{html.escape(email)} is already linked to another user of this bot.</p>", 409)
@@ -180,7 +186,8 @@ async def oauth_callback(state: str = "", code: str = "", error: str = ""):
     verb = "reconnected" if result == LinkResult.UPDATED else "connected"
     await reply(
         user.chat_id,
-        f"✅ {escape_markdown(email)} {verb}.{note}\n\nYou'll get your summary at the next scheduled run. /accounts shows linked accounts.",
+        f"✅ {escape_markdown(email)} {verb}.{note}\n\nSummaries arrive at 08:00 and 20:00 in your timezone "
+        f"({escape_markdown(user_tz_name(user))}) — change it with /timezone. /accounts shows linked accounts.",
     )
     return _page(
         "Account connected ✅",

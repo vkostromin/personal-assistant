@@ -68,6 +68,7 @@ def fetch_messages(
     except HttpError:
         return []
 
+    me = f"users/{account.google_sub}" if account.google_sub else None
     filtered = []
     for msg in result.get("messages", []):
         created = None
@@ -76,9 +77,12 @@ def fetch_messages(
         if last_run and created and created < last_run:
             continue
 
+        sender = msg.get("sender", {})
+        is_me = bool(me) and sender.get("name") == me
         filtered.append(
             {
-                "sender": msg.get("sender", {}).get("displayName", "Unknown"),
+                "sender": "Me" if is_me else sender.get("displayName") or sender.get("name") or "Unknown",
+                "is_me": is_me,
                 "text": msg.get("text", ""),
                 "time": msg.get("createTime", ""),
                 "space": space.get("displayName", space.get("name", "")),
@@ -86,3 +90,13 @@ def fetch_messages(
         )
 
     return filtered
+
+
+def space_link(space: dict | str) -> str:
+    """Web link to a Chat space / DM ("spaces/AAAA" -> https://chat.google.com/room/AAAA)."""
+    name = space if isinstance(space, str) else space.get("name", "")
+    space_id = name.split("/", 1)[-1] if name else ""
+    if not space_id:
+        return ""
+    kind = "" if isinstance(space, str) else space.get("spaceType", "")
+    return f"https://chat.google.com/{'dm' if kind == 'DIRECT_MESSAGE' else 'room'}/{space_id}"

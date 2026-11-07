@@ -4,12 +4,13 @@ Collections
 -----------
 users/{telegram_user_id}   User (role admin|user, status active|disabled)
 accounts/{email}           Google account linked to exactly one user (user_id)
-drafts/{auto}              user_id, account, ... status pending|...
-promises/{auto}            user_id, account, ... status open|done
+drafts/{auto}              user_id, account, gmail_draft_id, ... status pending|sent|discarded
+items/{auto}               promises / waiting-for / replies / to-dos (src/models.Item)
+promises/{auto}            legacy, migrated to items (schema v3)
 invites/{code}             single-use invitation codes
-usage/{telegram_user_id}   LLM usage in the current window (per-user limits)
-llm_keys/{telegram_user_id} user's own LLM provider/key (encrypted) -> no limits
 oauth_states/{state}       pending "connect Google account" links (single use)
+usage/{telegram_user_id}   shared-LLM token usage in the current window
+llm_keys/{telegram_user_id} user's own LLM provider + encrypted API key
 settings/app               admin_user_id, schema_version
 settings/global, state/global   legacy single-user docs (read once by the migration)
 """
@@ -24,11 +25,11 @@ from google.cloud.firestore import FieldFilter
 
 from src import config
 from src.crypto import decrypt, encrypt
-from src.models import Account, Invite, OAuthState, User, utcnow
+from src.models import Account, Invite, Item, OAuthState, User, UserLLMKey, utcnow
 
 log = logging.getLogger(__name__)
 
-SCHEMA_VERSION = 2
+SCHEMA_VERSION = 3
 
 
 def normalize_email(email: str) -> str:
@@ -117,17 +118,57 @@ class FirestoreStore:
 
         return await self._run_in_transaction(txn)
 
+    async def claim_run_slot(self, user_id: int, slot: datetime) -> bool:
+        """Atomically mark ``slot`` as processed for the user. False if already claimed
+        (e.g. overlapping /run calls on several instances)."""
+        ref = self.db.collection("users").document(str(user_id))
+
+        async def txn(transaction):
+            snap = await ref.get(transaction=transaction)
+            if not snap.exists:
+                return False
+            last = _aware(snap.to_dict().get("last_run_slot"))
+            if last is not None and last >= slot:
+                return False
+            transaction.update(ref, {"last_run_slot": slot})
+            return True
+
+        return await self._run_in_transaction(txn)
+
+    async def transfer_admin(self, from_id: int, to_id: int) -> bool:
+        """Make ``to_id`` the admin and ``from_id`` a regular user (atomically)."""
+        meta_ref = self._meta_ref()
+        from_ref = self.db.collection("users").document(str(from_id))
+        to_ref = self.db.collection("users").document(str(to_id))
+
+        async def txn(transaction):
+            meta = await meta_ref.get(transaction=transaction)
+            target = await to_ref.get(transaction=transaction)
+            if not meta.exists or meta.to_dict().get("admin_user_id") != from_id:
+                return False
+            if not target.exists or target.to_dict().get("status") != "active":
+                return False
+            transaction.update(to_ref, {"role": "admin"})
+            transaction.update(from_ref, {"role": "user"})
+            transaction.set(meta_ref, {"admin_user_id": to_id, "admin_since": utcnow()}, merge=True)
+            return True
+
+        return await self._run_in_transaction(txn)
+
     async def delete_user(self, user_id: int) -> list[Account]:
         """Delete a user and all their data. Returns removed accounts (for token revocation)."""
         accounts = await self.list_accounts(user_id=user_id, enabled_only=False)
         for acc in accounts:
             await self.delete_account(acc.email)
-        for coll in ("drafts", "promises"):
+        for coll in ("drafts", "items", "promises"):
             async for doc in self.db.collection(coll).where(filter=FieldFilter("user_id", "==", user_id)).stream():
                 await doc.reference.delete()
-        for coll in ("llm_keys", "usage"):
-            await self.db.collection(coll).document(str(user_id)).delete()
+        await self.db.collection("usage").document(str(user_id)).delete()
+        await self.db.collection("llm_keys").document(str(user_id)).delete()
         await self.db.collection("users").document(str(user_id)).delete()
+        if await self.get_admin_id() == user_id:
+            # the (only) admin left: the next /start sets the bot up again
+            await self._meta_ref().set({"admin_user_id": None}, merge=True)
         return accounts
 
     # --------------------------------------------------------------- invites
@@ -288,6 +329,7 @@ class FirestoreStore:
                     "providers": account.providers,
                     "enabled": True,
                     "needs_reauth": False,
+                    "google_sub": account.google_sub or existing.get("google_sub", ""),
                 })
                 return LinkResult.UPDATED
             new = account.model_copy(update={"email": email})
@@ -301,13 +343,13 @@ class FirestoreStore:
         await self.db.collection("accounts").document(email).update(updates)
 
     async def delete_account(self, email: str) -> None:
-        """Delete an account link plus its drafts and promises."""
-        for coll in ("drafts", "promises"):
+        """Delete an account link plus its drafts and items."""
+        for coll in ("drafts", "items", "promises"):
             async for doc in self.db.collection(coll).where(filter=FieldFilter("account", "==", email)).stream():
                 await doc.reference.delete()
         await self.db.collection("accounts").document(email).delete()
 
-    # ------------------------------------------------------ drafts/promises
+    # ---------------------------------------------------------------- drafts
     async def save_draft(self, user_id: int, draft_data: dict) -> str:
         doc_ref = self.db.collection("drafts").document()
         await doc_ref.set({**draft_data, "user_id": user_id, "created_at": utcnow()})
@@ -330,76 +372,99 @@ class FirestoreStore:
     async def update_draft(self, draft_id: str, updates: dict) -> None:
         await self.db.collection("drafts").document(draft_id).update(updates)
 
-    async def save_promise(self, user_id: int, promise_data: dict) -> str:
-        doc_ref = self.db.collection("promises").document()
-        await doc_ref.set({**promise_data, "user_id": user_id, "created_at": utcnow(), "status": "open"})
-        return doc_ref.id
+    async def delete_draft(self, draft_id: str) -> None:
+        await self.db.collection("drafts").document(draft_id).delete()
 
-    async def get_open_promises(self, user_id: int) -> list[dict]:
+    async def get_draft(self, draft_id: str) -> dict | None:
+        if not draft_id or "/" in draft_id:
+            return None
+        doc = await self.db.collection("drafts").document(draft_id).get()
+        if not doc.exists:
+            return None
+        return {**doc.to_dict(), "id": doc.id}
+
+    async def drafts_due_for_reminder(self, now: datetime) -> list[dict]:
+        query = self.db.collection("drafts").where(filter=FieldFilter("next_remind_at", "<=", now))
+        return [{**doc.to_dict(), "id": doc.id} async for doc in query.stream()]
+
+    # ----------------------------------------------------------------- items
+    @staticmethod
+    def _item_from_doc(doc) -> Item:
+        return Item(**{**doc.to_dict(), "id": doc.id})
+
+    async def create_item(self, item: Item) -> str:
+        ref = self.db.collection("items").document()
+        await ref.set(item.model_dump(exclude={"id"}))
+        return ref.id
+
+    async def get_item(self, item_id: str) -> Item | None:
+        if not item_id or "/" in item_id:
+            return None
+        doc = await self.db.collection("items").document(item_id).get()
+        return self._item_from_doc(doc) if doc.exists else None
+
+    async def update_item(self, item_id: str, updates: dict) -> None:
+        await self.db.collection("items").document(item_id).update(updates)
+
+    async def list_open_items(self, user_id: int) -> list[Item]:
         query = (
-            self.db.collection("promises")
+            self.db.collection("items")
             .where(filter=FieldFilter("user_id", "==", user_id))
             .where(filter=FieldFilter("status", "==", "open"))
         )
-        result = []
-        async for doc in query.stream():
-            data = doc.to_dict()
-            data["id"] = doc.id
-            result.append(data)
-        return sorted(result, key=lambda d: (_aware(d.get("created_at")) or utcnow(), d["id"]))
+        items = [self._item_from_doc(doc) async for doc in query.stream()]
+        return sorted(items, key=lambda i: (_aware(i.created_at), i.id))
 
-    async def close_promise(self, promise_id: str) -> None:
-        await self.db.collection("promises").document(promise_id).update({"status": "done"})
+    async def find_open_item(self, user_id: int, fingerprint: str) -> Item | None:
+        query = (
+            self.db.collection("items")
+            .where(filter=FieldFilter("user_id", "==", user_id))
+            .where(filter=FieldFilter("fingerprint", "==", fingerprint))
+            .where(filter=FieldFilter("status", "==", "open"))
+        )
+        async for doc in query.stream():
+            return self._item_from_doc(doc)
+        return None
+
+    async def items_due_for_reminder(self, now: datetime) -> list[Item]:
+        """Single-field range query (automatic index). Closed items have next_remind_at = None."""
+        query = self.db.collection("items").where(filter=FieldFilter("next_remind_at", "<=", now))
+        return [self._item_from_doc(doc) async for doc in query.stream()]
+
+    # ------------------------------------------------------- pending actions
+    async def set_pending_action(self, user_id: int, action: dict | None) -> None:
+        await self.db.collection("users").document(str(user_id)).update({"pending_action": action})
 
     # ------------------------------------------------------------ LLM usage
-    # usage/{user_id}: window_start, tokens, emails. A window starts at the user's
-    # scheduled run (or at first use after the previous window expired).
     async def get_usage(self, user_id: int) -> dict:
         doc = await self.db.collection("usage").document(str(user_id)).get()
         return doc.to_dict() if doc.exists else {}
 
-    async def start_usage_window(self, user_id: int, now: datetime | None = None) -> None:
+    async def reset_usage(self, user_id: int, window_start: datetime, tokens: int = 0, own_tokens: int = 0) -> None:
         await self.db.collection("usage").document(str(user_id)).set(
-            {"window_start": now or utcnow(), "tokens": 0, "emails": 0}
+            {"window_start": window_start, "tokens": tokens, "own_tokens": own_tokens}
         )
 
-    async def add_usage(self, user_id: int, tokens: int = 0, emails: int = 0) -> None:
-        if not tokens and not emails:
-            return
-        ref = self.db.collection("usage").document(str(user_id))
-        window = timedelta(hours=config.settings.usage_window_hours)
+    async def increment_usage(self, user_id: int, tokens: int, own: bool = False) -> None:
+        """Atomic increment — several requests of one user may run concurrently."""
+        field = "own_tokens" if own else "tokens"
+        await self.db.collection("usage").document(str(user_id)).set({field: firestore.Increment(tokens)}, merge=True)
 
-        async def txn(transaction):
-            snap = await ref.get(transaction=transaction)
-            data = snap.to_dict() if snap.exists else {}
-            now = utcnow()
-            start = _aware(data.get("window_start"))
-            if start is None or start + window <= now:
-                data = {"window_start": now, "tokens": 0, "emails": 0}
-            data["tokens"] = int(data.get("tokens", 0)) + int(tokens)
-            data["emails"] = int(data.get("emails", 0)) + int(emails)
-            transaction.set(ref, data)
-
-        await self._run_in_transaction(txn)
-
-    # ------------------------------------------------------ personal LLM keys
-    async def get_user_llm(self, user_id: int) -> dict | None:
+    # ------------------------------------------------------------- LLM keys
+    async def get_llm_key(self, user_id: int) -> UserLLMKey | None:
         doc = await self.db.collection("llm_keys").document(str(user_id)).get()
         if not doc.exists:
             return None
         data = doc.to_dict()
         data["api_key"] = decrypt(data.get("api_key", ""), config.settings.token_encryption_key)
-        return data
+        return UserLLMKey(**data)
 
-    async def set_user_llm(self, user_id: int, provider: str, api_key: str, model: str) -> None:
-        await self.db.collection("llm_keys").document(str(user_id)).set({
-            "provider": provider,
-            "api_key": encrypt(api_key, config.settings.token_encryption_key),
-            "model": model,
-            "updated_at": utcnow(),
-        })
+    async def set_llm_key(self, user_id: int, key: UserLLMKey) -> None:
+        data = key.model_dump()
+        data["api_key"] = encrypt(key.api_key, config.settings.token_encryption_key)
+        await self.db.collection("llm_keys").document(str(user_id)).set(data)
 
-    async def delete_user_llm(self, user_id: int) -> bool:
+    async def delete_llm_key(self, user_id: int) -> bool:
         ref = self.db.collection("llm_keys").document(str(user_id))
         if not (await ref.get()).exists:
             return False
@@ -486,9 +551,29 @@ class FirestoreStore:
                 await doc.reference.update(updates)
         await self._assign_orphan_records(fallback_user_id=owner_id)
 
+        await self._promises_to_items()
+
         await self._meta_ref().set({"schema_version": SCHEMA_VERSION}, merge=True)
         log.info("Migration to schema v%d complete", SCHEMA_VERSION)
         return True
+
+    async def _promises_to_items(self) -> None:
+        """v3: free-text promises become items (kind "promise", no due date)."""
+        moved = 0
+        async for doc in self.db.collection("promises").stream():
+            data = doc.to_dict()
+            if data.get("user_id") is not None and data.get("status", "open") == "open" and data.get("text"):
+                source = data.get("source") if data.get("source") in ("email", "chat") else "manual"
+                item = Item(
+                    user_id=data["user_id"], kind="promise", title=data["text"][:300], source=source,
+                    account=data.get("account") or "", detail=data.get("source_detail") or "",
+                    created_at=_aware(data.get("created_at")) or utcnow(),
+                )
+                await self.create_item(item)
+                moved += 1
+            await doc.reference.delete()
+        if moved:
+            log.info("Migration: %d open promises moved to items", moved)
 
 
 _store: FirestoreStore | None = None

@@ -5,8 +5,8 @@ class Settings(BaseSettings):
     project_id: str = ""
     google_client_id: str = ""
     google_client_secret: str = ""
-    # Shared (server) LLM: the FIRST provider with a key set is used, in this order:
-    # Gemini -> DeepSeek -> OpenAI. Users can bring their own key with /setkey.
+    # --- Shared (server) LLM. The first provider in LLM_PROVIDER_ORDER with a key set is used.
+    llm_provider_order: str = "gemini,deepseek,openai"
     gemini_api_key: str = ""
     gemini_model: str = "gemini-2.5-flash-lite"
     deepseek_api_key: str = ""
@@ -14,6 +14,13 @@ class Settings(BaseSettings):
     deepseek_model: str = "deepseek-v4-flash"
     openai_api_key: str = ""
     openai_model: str = "gpt-4.1-mini"
+
+    # Per-user limit for the shared LLM key, in tokens (prompt + completion) per usage window.
+    # Sized for ~100 emails + chat + digest + a few interactive commands per 12h (see README).
+    # Users with their own API key (/setkey) and admins are not limited.
+    user_token_limit: int = 150_000
+    # The window restarts at every scheduled run (and at the latest after this many hours).
+    usage_window_hours: int = 12
     telegram_bot_token: str = ""
     # Optional: bot username without "@" (otherwise fetched via getMe) — used for invite links
     telegram_bot_username: str = ""
@@ -34,35 +41,29 @@ class Settings(BaseSettings):
     # If empty, the first user who sends /start to a fresh deployment becomes admin.
     admin_telegram_id: str = ""
 
-    # ---- Per-user limits when using the shared key (own key = no limits) ----
-    # Usage window: reset by each scheduled run (and after this many hours at the latest)
-    usage_window_hours: int = 12
-    # LLM tokens per window. ~100 emails with drafts + chat + summary need ~60-90k;
-    # the rest is for /rewrite, /chat, /raw. When used up, drafts and these commands are
-    # paused until the next run. 0 = unlimited.
-    user_token_limit: int = 150_000
-    # Emails analysed per window (per scheduled run)
-    user_email_limit: int = 100
-    # Admins use the shared key without limits unless this is true
-    limit_admins: bool = False
+    # Summaries are sent at these local hours in each user's timezone (scheduler runs hourly)
+    summary_hours: str = "8,20"
+    # Timezone for users who haven't set one with /timezone
+    default_timezone: str = "UTC"
 
-    # ---- Run-time safety (Cloud Run request timeout is 300s) ----
-    # Hard cap on emails per user per run, also for own-key users and admins
-    max_emails_per_run: int = 200
-    email_batch_size: int = 20  # emails per LLM call
-    max_chat_spaces: int = 10  # most recently active spaces analysed per account per run
-    # Stop starting new LLM work after this many seconds; the rest is reported as skipped
-    run_time_budget_seconds: int = 240
+    # No proactive reminders during these local hours ("21-8" = 21:00..08:00)
+    quiet_hours: str = "21-8"
+    # "Waiting for" items without an explicit deadline are due after this many hours
+    waiting_default_hours: int = 48
+    # Max reminder cards per user per hourly run (the rest follow next hour)
+    max_reminders_per_run: int = 5
 
     invite_ttl_hours: int = 72
     oauth_link_ttl_minutes: int = 15
     # How far back to look for a newly linked account's first run
     initial_lookback_hours: int = 12
     # How many users are processed in parallel during a scheduled run
-    run_concurrency: int = 3
+    run_concurrency: int = 5
+    # Stop *starting* users/accounts after this many seconds, so /run finishes inside the
+    # Cloud Run request timeout (300s) instead of being killed half-way through an account.
+    run_soft_deadline_seconds: int = 240
 
-    # env_ignore_empty: Cloud Build passes unset substitutions as "" -> use the default
-    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore", "env_ignore_empty": True}
+    model_config = {"env_file": ".env", "env_file_encoding": "utf-8", "extra": "ignore"}
 
     @property
     def admin_telegram_id_int(self) -> int | None:

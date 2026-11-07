@@ -85,15 +85,17 @@ class TestRunAuth:
 
     def test_run_allows_no_secret_configured(self, client, monkeypatch):
         use_settings(monkeypatch, run_secret="")
-        with patch("src.main.run_all_users", new_callable=AsyncMock, return_value={}):
+        with patch("src.main.run_all_users", new_callable=AsyncMock, return_value={}), \
+                patch("src.main.run_reminders", new_callable=AsyncMock, return_value={}):
             response = client.post("/run", headers={"X-Run-Secret": "anything"})
         assert response.json() == {"status": "ok"}
 
     def test_run_allows_correct_secret(self, client, monkeypatch):
         use_settings(monkeypatch, run_secret="correct-run-secret")
-        with patch("src.main.run_all_users", new_callable=AsyncMock, return_value={"users": 2}):
+        with patch("src.main.run_all_users", new_callable=AsyncMock, return_value={"users": 2}), \
+                patch("src.main.run_reminders", new_callable=AsyncMock, return_value={"reminders": 1}):
             response = client.post("/run", headers={"X-Run-Secret": "correct-run-secret"})
-        assert response.json() == {"status": "ok", "users": 2}
+        assert response.json() == {"status": "ok", "users": 2, "reminders": 1}
 
 
 class TestPublicUrl:

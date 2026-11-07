@@ -9,29 +9,49 @@ import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
+from google.auth.exceptions import RefreshError
+
 from src import config
-from src.gmail_client import DraftGone, create_draft, update_draft
-from src.llm_client import LLM, PROVIDERS, answer_question, check_key, rewrite_draft, user_llm
-from src.models import User
+from src.callbacks import add_task_from_text, handle_callback, handle_free_text
+from src.cards import draft_card, focus_message, numbered_keyboard, tasks_message
+from src.drafts_sync import sync_note, sync_user_drafts
+from src.items import rank_focus
+from src.gmail_client import check_drafts, delete_gmail_draft, update_gmail_draft
+from src.llm_client import LLM, LLMError, chat_completion, answer_question, rewrite_draft
+from src.models import User, UserLLMKey, utcnow
 from src.oauth import make_code_verifier, revoke_token
-from src.quota import get_budget, limit_message, record_usage, resolve_llm
+from src.providers import PROVIDERS, user_llm_config
+from src.quota import LLMUnavailable, QuotaExceeded, effective_limit, get_llm, limit_reached_text, usage_status
+from src.schedule import current_slot, fmt_local, next_slot, parse_timezone, summary_hours, user_tz, user_tz_name
 from src.state import RedeemResult, get_store, normalize_email
 from src.telegram_client import delete_message, escape_markdown, get_bot_username, send_message, url_button
 
 log = logging.getLogger(__name__)
 
 USER_HELP = (
+    "🎯 /focus — what to do right now\n"
+    "📋 /tasks — promises, waiting-for, replies, to-dos\n"
+    "/task <text> — add a task (or just send / forward me any message)\n"
     "/status — current state\n"
-    "/drafts — pending email drafts\n"
-    "/rewrite N <context> — update draft N\n"
-    "/raw <text> — analyze text\n"
     "/chat <question> — ask about your state\n"
+    "/raw <text> — analyze text\n\n"
+    "📧 Drafts\n"
+    "/drafts — pending drafts (synced with Gmail)\n"
+    "/draft N — draft N with Send / Rewrite / Snooze buttons\n"
+    "/rewrite N <context> — update draft N\n"
+    "/sent N… — mark draft(s) as sent\n"
+    "/deletedraft N… — delete draft(s) here and in Gmail\n\n"
+    "🔗 Google accounts\n"
     "/connect — link a Google account\n"
-    "/accounts — your linked Google accounts\n"
-    "/disconnect <email> — unlink a Google account\n"
-    "/usage — AI usage and limits\n"
+    "/accounts — linked accounts\n"
+    "/unlink [email] <gmail|chat> — stop using Gmail or Chat of an account\n"
+    "/disconnect <email> — unlink an account and revoke access\n\n"
+    "⚙️ Settings\n"
+    "/timezone [zone] — your timezone (summaries at 08:00 and 20:00)\n"
+    "/llm — AI provider and usage limit\n"
     "/setkey <provider> <key> [model] — use your own AI key (no limits)\n"
-    "/removekey — remove your own AI key\n"
+    "/removekey — stop using your own AI key\n"
+    "/deleteme — delete your Lola account and all your data\n"
     "/help — all commands"
 )
 
@@ -43,7 +63,9 @@ ADMIN_HELP = (
     "/users — list users\n"
     "/disable <user id> — block a user\n"
     "/enable <user id> — unblock a user\n"
-    "/remove <user id> — delete a user and all their data"
+    "/remove <user id> — delete a user and all their data\n"
+    "/setlimit <user id> <tokens|default|unlimited> — AI limit per 12h\n"
+    "/transferadmin <user id> — make another user the admin"
 )
 
 NOT_INVITED = (
@@ -77,19 +99,6 @@ def help_text(user: User) -> str:
     return USER_HELP + (ADMIN_HELP if user.is_admin else "")
 
 
-async def llm_for_command(ctx: Ctx) -> LLM | None:
-    """LLM for an interactive AI command, or None (user already told why) if over the limit."""
-    llm = await resolve_llm(ctx.user)
-    if llm is None:
-        await reply(ctx.chat_id, "⚠️ No AI provider is configured on the server. Add your own key with /setkey.")
-        return None
-    budget = await get_budget(ctx.user, llm)
-    if budget.exhausted:
-        await reply(ctx.chat_id, limit_message(budget))
-        return None
-    return llm
-
-
 async def connect_markup(user_id: int, base_url: str) -> dict | None:
     """Create a single-use OAuth link for ``user_id`` as an inline button."""
     s = config.settings
@@ -118,10 +127,16 @@ async def send_connect_prompt(chat_id: int, user_id: int, base_url: str, intro: 
 
 # --------------------------------------------------------------------- entry
 async def handle_update(update: dict, base_url: str) -> None:
+    if update.get("callback_query"):
+        cq = update["callback_query"]
+        if ((cq.get("message") or {}).get("chat") or {}).get("type", "private") == "private":
+            await handle_callback(cq)
+        return
     msg = update.get("message") or {}
     chat = msg.get("chat") or {}
     chat_id = chat.get("id")
-    text = (msg.get("text") or "").strip()
+    # forwarded photos/documents carry their text as caption
+    text = (msg.get("text") or msg.get("caption") or "").strip()
     if not chat_id or not text:
         return
 
@@ -148,6 +163,10 @@ async def handle_update(update: dict, base_url: str) -> None:
         await store.update_user(user.id, {"name": name or user.name, "username": username})
         user = user.model_copy(update={"name": name or user.name, "username": username})
 
+    if not cmd:
+        # plain or forwarded text: answer a pending question, or offer "add as task / ask"
+        await handle_free_text(user, chat_id, text)
+        return
     handler = USER_COMMANDS.get(cmd)
     if handler is None and user.is_admin:
         handler = ADMIN_COMMANDS.get(cmd)
@@ -176,7 +195,10 @@ async def _handle_unregistered(chat_id: int, new_user: User, cmd: str, args: str
             )
             if adopted:
                 intro += "\n\nExisting accounts assigned to you: " + ", ".join(escape_markdown(a) for a in adopted)
-            await send_connect_prompt(chat_id, new_user.id, base_url, intro + "\n\nNext step: link your Google account.")
+            await send_connect_prompt(
+                chat_id, new_user.id, base_url,
+                intro + "\n\nNext step: link your Google account. Then set your timezone with /timezone.",
+            )
             return
 
     if not args:
@@ -192,7 +214,8 @@ async def _handle_unregistered(chat_id: int, new_user: User, cmd: str, args: str
             "👋 Welcome! I'm Lola, your AI personal assistant.\n\n"
             "Every 12 hours I check your email and Google Chat, send you a summary, "
             "highlight what needs your attention and prepare draft replies.\n\n"
-            "Next step: link your Google account.",
+            "Next step: link your Google account. Then set your timezone with /timezone, "
+            "e.g. `/timezone Europe/Berlin`.",
         )
         if invite:
             await reply(
@@ -210,6 +233,39 @@ async def _handle_unregistered(chat_id: int, new_user: User, cmd: str, args: str
         await reply(chat_id, "❌ This invitation link has expired. Ask the administrator for a new one.")
     else:
         await reply(chat_id, "❌ Invalid invitation link. Ask the administrator for a new one.")
+
+
+# ---------------------------------------------------------------- LLM helpers
+def _fmt_tokens(n: int) -> str:
+    return f"{n / 1000:.0f}k" if n >= 10_000 else f"{n:,}"
+
+
+def _llm_error_text(llm: LLM, exc: LLMError) -> str:
+    if llm.config.own_key:
+        return (
+            f"⚠️ Your {llm.config.provider} API key returned an error ({escape_markdown(str(exc)[:150])}).\n"
+            "Update it with /setkey or /removekey to use the shared assistant."
+        )
+    return "⚠️ The AI service is temporarily unavailable. Please try again later."
+
+
+async def _get_llm_or_reply(ctx: Ctx) -> LLM | None:
+    try:
+        return await get_llm(ctx.user)
+    except LLMUnavailable:
+        await reply(ctx.chat_id, "⚠️ No shared AI provider is configured. Add your own key with /setkey.")
+        return None
+
+
+async def _guarded(ctx: Ctx, llm: LLM, call) -> tuple[bool, object]:
+    """Await an LLM call; on limit/provider errors tell the user and return (False, None)."""
+    try:
+        return True, await call
+    except QuotaExceeded:
+        await reply(ctx.chat_id, limit_reached_text(await usage_status(ctx.user), ctx.user))
+    except LLMError as exc:
+        await reply(ctx.chat_id, _llm_error_text(llm, exc))
+    return False, None
 
 
 # -------------------------------------------------------------- user commands
@@ -237,9 +293,12 @@ async def cmd_accounts(ctx: Ctx) -> None:
     lines = ["🔗 Linked Google accounts:\n"]
     for acc in accounts:
         status = "🔑 needs /connect" if acc.needs_reauth else ("⏸ disabled" if not acc.enabled else "✅")
-        last = acc.last_run.strftime("%b %d %H:%M UTC") if acc.last_run else "not checked yet"
-        lines.append(f"{status} {escape_markdown(acc.email)} — {', '.join(acc.providers) or 'no access'} — {last}")
-    lines.append("\n/connect to add another, /disconnect <email> to remove.")
+        last = fmt_local(acc.last_run, ctx.user) if acc.last_run else "not checked yet"
+        lines.append(f"{status} {escape_markdown(acc.email)} — {', '.join(acc.providers) or 'nothing'} — {last}")
+    lines.append(
+        "\n/connect to add another (or to re-enable Gmail/Chat), /unlink <email> <gmail|chat> to stop using one, "
+        "/disconnect <email> to remove."
+    )
     await reply(ctx.chat_id, "\n".join(lines))
 
 
@@ -256,28 +315,89 @@ async def cmd_disconnect(ctx: Ctx) -> None:
         return
     await revoke_token(account.refresh_token)
     await store.delete_account(account.email)
-    await reply(ctx.chat_id, f"✅ {escape_markdown(account.email)} disconnected and access revoked.")
+    await reply(
+        ctx.chat_id,
+        f"✅ {escape_markdown(account.email)} disconnected and Google access revoked. "
+        "Its drafts were removed from Lola (drafts already in Gmail stay there).",
+    )
+
+
+async def cmd_unlink(ctx: Ctx) -> None:
+    """Stop using Gmail or Chat of one account, keeping the other."""
+    store = get_store()
+    usage = "Usage: /unlink [email] <gmail|chat>\nExample: /unlink me@company.com chat"
+    parts = ctx.args.lower().split()
+    if not parts or parts[-1] not in ("gmail", "chat") or len(parts) > 2:
+        await reply(ctx.chat_id, usage)
+        return
+    provider = parts[-1]
+    mine = await store.list_accounts(user_id=ctx.user.id, enabled_only=False)
+    if len(parts) == 2:
+        account = next((a for a in mine if normalize_email(a.email) == normalize_email(parts[0])), None)
+    elif len(mine) == 1:
+        account = mine[0]
+    else:
+        await reply(ctx.chat_id, "You have several accounts — say which one.\n" + usage)
+        return
+    if account is None:
+        await reply(ctx.chat_id, "No such account linked to you. See /accounts.")
+        return
+    if provider not in account.providers:
+        await reply(ctx.chat_id, f"{provider.capitalize()} is not in use for {escape_markdown(account.email)}.")
+        return
+    remaining = [p for p in account.providers if p != provider]
+    if not remaining:
+        await revoke_token(account.refresh_token)
+        await store.delete_account(account.email)
+        await reply(
+            ctx.chat_id,
+            f"✅ {provider.capitalize()} was the last thing Lola used from {escape_markdown(account.email)}, "
+            "so the account was disconnected and Google access revoked.",
+        )
+        return
+    await store.update_account(account.email, {"providers": remaining})
+    await reply(
+        ctx.chat_id,
+        f"✅ Lola no longer reads {provider.capitalize()} of {escape_markdown(account.email)}. "
+        "Use /connect with this account to turn it back on, or /disconnect to revoke Google access completely.",
+    )
 
 
 async def cmd_status(ctx: Ctx) -> None:
     store = get_store()
     drafts = await store.get_pending_drafts(ctx.user.id)
-    promises = await store.get_open_promises(ctx.user.id)
+    items = await store.list_open_items(ctx.user.id)
     accounts = await store.list_accounts(user_id=ctx.user.id)
     runs = [a.last_run for a in accounts if a.last_run]
-    last_run = max(runs).strftime("%b %d %H:%M UTC") if runs else "never"
+    now = utcnow()
+    overdue = [i for i in items if i.due_at and i.due_at < now]
+    counts = {k: sum(1 for i in items if i.kind == k) for k in ("promise", "waiting", "reply", "todo")}
+    last_run = fmt_local(max(runs), ctx.user) if runs else "never"
+    next_run = fmt_local(next_slot(utcnow(), user_tz(ctx.user)), ctx.user, "%H:%M")
     draft_text = f"{len(drafts)} pending drafts" if drafts else "no pending drafts"
-    promise_text = f"{len(promises)} open promises" if promises else "no open promises"
+    promise_text = (
+        f"{counts['promise']} promised · {counts['waiting']} waiting for · {counts['reply']} to reply · {counts['todo']} to do"
+        + (f" — ⚠️ {len(overdue)} overdue" if overdue else "")
+    )
+    usage = await usage_status(ctx.user)
+    if usage.own_key:
+        ai_text = f"own {usage.provider} key"
+    elif usage.limit is None:
+        ai_text = "unlimited"
+    else:
+        ai_text = f"{_fmt_tokens(usage.used)} / {_fmt_tokens(usage.limit)} tokens" + (" — limit reached" if usage.exhausted else "")
     await reply(
         ctx.chat_id,
-        f"📋 Status\n\n🔗 {len(accounts)} linked account(s)\n📧 {draft_text}\n⚠️ {promise_text}\n🕐 Last check: {last_run}",
+        f"📋 Status\n\n🔗 {len(accounts)} linked account(s)\n📧 {draft_text}\n📌 {promise_text}\n"
+        f"🕐 Last check: {last_run}, next summary {next_run} ({escape_markdown(user_tz_name(ctx.user))})\n🤖 AI: {ai_text}",
     )
 
 
 async def cmd_drafts(ctx: Ctx) -> None:
+    note = sync_note(await sync_user_drafts(ctx.user.id))
     drafts = await get_store().get_pending_drafts(ctx.user.id)
     if not drafts:
-        await reply(ctx.chat_id, "No pending drafts.")
+        await reply(ctx.chat_id, "\n\n".join(p for p in (note, "No pending drafts.") if p))
         return
     lines = []
     for i, d in enumerate(drafts, 1):
@@ -287,7 +407,92 @@ async def cmd_drafts(ctx: Ctx) -> None:
         lines.append(f"{i}. To: {to_esc} — \"{subj_esc}\"")
         lines.append(f"   {body_preview}...")
     entries = "\n".join(lines)
-    await reply(ctx.chat_id, f"📧 Pending drafts:\n\n{entries}\n\nUse /rewrite N <context> to update a draft.")
+    await reply(
+        ctx.chat_id,
+        (note + "\n\n" if note else "")
+        + f"📧 Pending drafts:\n\n{entries}\n\n"
+        "Tap a number for Send / Rewrite / Snooze / Discard.",
+        numbered_keyboard([("d", d["id"]) for d in drafts[:25]]),
+    )
+
+
+def parse_draft_numbers(args: str, count: int) -> list[int] | None:
+    """'1 3', '1,3', '2-4' or 'all' -> sorted 0-based indexes; None if invalid/out of range."""
+    text = args.replace(",", " ").strip().lower()
+    if not text:
+        return None
+    if text == "all":
+        return list(range(count)) or None
+    result = set()
+    for part in text.split():
+        lo, _, hi = part.partition("-")
+        if not lo.isdigit() or (hi and not hi.isdigit()):
+            return None
+        start, end = int(lo), int(hi or lo)
+        if start < 1 or end > count or start > end:
+            return None
+        result.update(range(start - 1, end))
+    return sorted(result)
+
+
+async def _selected_drafts(ctx: Ctx, usage: str) -> list[dict] | None:
+    drafts = await get_store().get_pending_drafts(ctx.user.id)
+    if not drafts:
+        await reply(ctx.chat_id, "No pending drafts.")
+        return None
+    idx = parse_draft_numbers(ctx.args, len(drafts))
+    if idx is None:
+        await reply(ctx.chat_id, f"{usage}\nYou have {len(drafts)} pending draft(s), see /drafts.")
+        return None
+    return [drafts[i] for i in idx]
+
+
+async def cmd_draft(ctx: Ctx) -> None:
+    selected = await _selected_drafts(ctx, "Usage: /draft N")
+    if not selected:
+        return
+    for d in selected[:3]:
+        text, markup = draft_card(d, ctx.user, utcnow())
+        await reply(ctx.chat_id, text, markup)
+
+
+async def cmd_sent(ctx: Ctx) -> None:
+    selected = await _selected_drafts(ctx, "Usage: /sent N… (e.g. /sent 1 3, /sent 2-4, /sent all)")
+    if not selected:
+        return
+    store = get_store()
+    for d in selected:
+        await store.update_draft(d["id"], {"status": "sent", "status_changed_at": utcnow(), "status_source": "user"})
+    await reply(ctx.chat_id, f"✅ {len(selected)} draft(s) marked as sent. /drafts shows the rest.")
+
+
+async def cmd_deletedraft(ctx: Ctx) -> None:
+    s = config.settings
+    selected = await _selected_drafts(ctx, "Usage: /deletedraft N… (e.g. /deletedraft 1 3, /deletedraft all)")
+    if not selected:
+        return
+    store = get_store()
+    kept_in_gmail = 0
+    for d in selected:
+        account = await store.get_account(d.get("account", ""))
+        if d.get("gmail_draft_id") and account and account.user_id == ctx.user.id:
+            try:
+                ok = await asyncio.to_thread(
+                    delete_gmail_draft,
+                    account=account,
+                    client_id=s.google_client_id,
+                    client_secret=s.google_client_secret,
+                    draft_id=d["gmail_draft_id"],
+                )
+            except RefreshError:
+                ok = False
+            if not ok:
+                kept_in_gmail += 1
+        await store.delete_draft(d["id"])
+    text = f"🗑 {len(selected)} draft(s) deleted."
+    if kept_in_gmail:
+        text += f" {kept_in_gmail} couldn't be removed from Gmail (no access) — delete them there manually."
+    await reply(ctx.chat_id, text)
 
 
 async def cmd_rewrite(ctx: Ctx) -> None:
@@ -307,58 +512,68 @@ async def cmd_rewrite(ctx: Ctx) -> None:
         await reply(ctx.chat_id, "Draft number out of range")
         return
     draft = drafts[idx]
+
     account = await store.get_account(draft.get("account", ""))
     if account is None or account.user_id != ctx.user.id:
-        await reply(ctx.chat_id, "The Google account of this draft is no longer linked.")
+        await reply(ctx.chat_id, "The Google account of this draft is no longer linked. See /accounts.")
         return
-
-    llm = await llm_for_command(ctx)
+    # Was it sent or deleted in Gmail meanwhile? Then don't rewrite (and don't spend AI tokens).
+    try:
+        gone = await asyncio.to_thread(
+            check_drafts, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret, drafts=[draft]
+        )
+    except RefreshError:
+        await reply(ctx.chat_id, f"🔑 Access to {escape_markdown(account.email)} expired — send /connect to reconnect it.")
+        return
+    if draft["id"] in gone:
+        status = gone[draft["id"]]
+        await store.update_draft(draft["id"], {"status": status, "status_changed_at": utcnow(), "status_source": "gmail"})
+        what = "already sent" if status == "sent" else "deleted in Gmail"
+        await reply(ctx.chat_id, f"This draft was {what}, so I removed it from the list. See /drafts.")
+        return
+    llm = await _get_llm_or_reply(ctx)
     if llm is None:
         return
-    try:
-        result = await rewrite_draft(
-            to=draft["to"],
-            subject=draft["subject"],
-            body=draft["body"],
-            context=parts[1],
-            llm=llm,
-            signature=s.signature,
-        )
-    finally:
-        await record_usage(ctx.user, llm)
+    ok, result = await _guarded(
+        ctx,
+        llm,
+        rewrite_draft(
+            to=draft["to"], subject=draft["subject"], body=draft["body"], context=parts[1], llm=llm, signature=s.signature
+        ),
+    )
+    if not ok:
+        return
     if not result:
         await reply(ctx.chat_id, "Failed to rewrite draft.")
         return
-    new_subject = result.get("subject") or draft["subject"]
-    new_body = result.get("body") or draft["body"]
+    new_subject = result.get("subject", draft["subject"])
+    new_body = result.get("body", draft["body"])
 
-    # Update the existing Gmail draft in place (no duplicates). If it's gone — sent or
-    # deleted in Gmail — or was never created, create a new one.
-    gmail_kwargs = dict(
-        account=account,
-        client_id=s.google_client_id,
-        client_secret=s.google_client_secret,
-        to=draft["to"],
-        subject=new_subject,
-        body=new_body,
-        thread_id=draft.get("thread_id"),
-    )
-    old_id = draft.get("gmail_draft_id")
-    note = ""
-    gmail_id = None
-    if old_id:
-        try:
-            gmail_id = await asyncio.to_thread(update_draft, draft_id=old_id, **gmail_kwargs)
-        except DraftGone:
-            note = "\nThe previous version was no longer in Gmail (sent or deleted), so I created a new draft."
-    if not gmail_id:
-        gmail_id = await asyncio.to_thread(create_draft, **gmail_kwargs)
-    if not gmail_id:
-        await reply(ctx.chat_id, "❌ Could not save the draft in Gmail. Please try again later.")
+    # Update the existing Gmail draft in place (no duplicates). Gmail first, so Firestore
+    # never claims a text that isn't in the user's mailbox.
+    old_gmail_id = draft.get("gmail_draft_id")
+    try:
+        gmail_id, created_new = await asyncio.to_thread(
+            update_gmail_draft,
+            account=account,
+            client_id=s.google_client_id,
+            client_secret=s.google_client_secret,
+            draft_id=old_gmail_id,
+            to=draft["to"],
+            subject=new_subject,
+            body=new_body,
+            thread_id=draft.get("thread_id"),
+            in_reply_to=draft.get("in_reply_to"),
+        )
+    except RefreshError:
+        await reply(ctx.chat_id, f"🔑 Access to {escape_markdown(account.email)} expired — send /connect to reconnect it.")
         return
-
+    if gmail_id is None:
+        await reply(ctx.chat_id, "❌ Gmail rejected the draft update. Please try again later.")
+        return
     await store.update_draft(draft["id"], {"subject": new_subject, "body": new_body, "gmail_draft_id": gmail_id})
-    await reply(ctx.chat_id, "✅ Draft updated in Gmail." + note)
+    note = " (the original was no longer in Gmail, so a new draft was created)" if created_new and old_gmail_id else ""
+    await reply(ctx.chat_id, f"✅ Draft updated in Gmail{note}.")
 
 
 async def cmd_raw(ctx: Ctx) -> None:
@@ -366,21 +581,23 @@ async def cmd_raw(ctx: Ctx) -> None:
     if not ctx.args:
         await reply(ctx.chat_id, "Usage: /raw <text>")
         return
-    llm = await llm_for_command(ctx)
+    llm = await _get_llm_or_reply(ctx)
     if llm is None:
         return
-    try:
-        response = await answer_question(
+    ok, response = await _guarded(
+        ctx,
+        llm,
+        answer_question(
             question=f"Analyze this text. What action items, promises, or questions are in it?\n\n{ctx.args}",
             drafts_summary="",
             promises_summary="",
             last_activity="",
             llm=llm,
             signature=s.signature,
-        )
-    finally:
-        await record_usage(ctx.user, llm)
-    await reply(ctx.chat_id, response)
+        ),
+    )
+    if ok:
+        await reply(ctx.chat_id, response)
 
 
 async def cmd_chat(ctx: Ctx) -> None:
@@ -389,104 +606,206 @@ async def cmd_chat(ctx: Ctx) -> None:
     if not ctx.args:
         await reply(ctx.chat_id, "Usage: /chat <question>")
         return
-    llm = await llm_for_command(ctx)
+    drafts = await store.get_pending_drafts(ctx.user.id)
+    items = await store.list_open_items(ctx.user.id)
+    runs = [a.last_run for a in await store.list_accounts(user_id=ctx.user.id) if a.last_run]
+    llm = await _get_llm_or_reply(ctx)
     if llm is None:
         return
-    drafts = await store.get_pending_drafts(ctx.user.id)
-    promises = await store.get_open_promises(ctx.user.id)
-    runs = [a.last_run for a in await store.list_accounts(user_id=ctx.user.id) if a.last_run]
-    try:
-        response = await answer_question(
+    ok, response = await _guarded(
+        ctx,
+        llm,
+        answer_question(
             question=ctx.args,
             drafts_summary=str(len(drafts)) if drafts else "none",
-            promises_summary="\n".join(f"- {escape_markdown(p.get('text', ''))}" for p in promises[:5]) if promises else "none",
+            promises_summary="\n".join(
+                f"- [{i.kind}] {i.title}" + (f" (due {fmt_local(i.due_at, ctx.user)})" if i.due_at else "")
+                for i in items[:15]
+            ) or "none",
             last_activity=max(runs).strftime("%b %d %H:%M") if runs else "never",
             llm=llm,
             signature=s.signature,
+        ),
+    )
+    if ok:
+        await reply(ctx.chat_id, response)
+
+
+# ------------------------------------------------------------ focus & tasks
+async def cmd_focus(ctx: Ctx) -> None:
+    store = get_store()
+    now = utcnow()
+    entries = rank_focus(await store.list_open_items(ctx.user.id), await store.get_pending_drafts(ctx.user.id), now, limit=5)
+    text, markup = focus_message(entries, ctx.user, now)
+    await reply(ctx.chat_id, text, markup)
+
+
+async def cmd_tasks(ctx: Ctx) -> None:
+    items = await get_store().list_open_items(ctx.user.id)
+    kind = {"mine": "promise", "promises": "promise", "waiting": "waiting", "replies": "reply", "todo": "todo"}.get(
+        ctx.args.strip().lower()
+    )
+    if kind:
+        items = [i for i in items if i.kind == kind]
+    text, markup = tasks_message(items, ctx.user, utcnow())
+    await reply(ctx.chat_id, text, markup)
+
+
+async def cmd_task(ctx: Ctx) -> None:
+    if not ctx.args:
+        await reply(
+            ctx.chat_id,
+            "Usage: /task <text>, e.g. `/task send contract to Anna by Friday` or "
+            "`/task Bob promised the invoice tomorrow`.\nYou can also just forward me any message.",
         )
-    finally:
-        await record_usage(ctx.user, llm)
-    await reply(ctx.chat_id, response)
-
-
-# ------------------------------------------------------------- AI key / usage
-def _providers_help() -> str:
-    lines = [f"• `{p.name}` — {p.label}, default model `{p.default_model}` (key: {p.key_help})" for p in PROVIDERS.values()]
-    return "\n".join(lines)
-
-
-async def cmd_usage(ctx: Ctx) -> None:
-    llm = await resolve_llm(ctx.user)
-    if llm is None:
-        await reply(ctx.chat_id, "⚠️ No AI provider is configured on the server. Add your own key with /setkey.")
         return
-    b = await get_budget(ctx.user, llm)
-    source = "your own key" if llm.own_key else "shared key"
-    lines = [f"🤖 AI: {escape_markdown(llm.label)} — {source}"]
-    if b.unlimited:
-        lines.append(f"✅ No AI limits. Up to {b.email_limit} emails are analysed per run.")
-        lines.append(f"Used this period: {b.tokens_used:,} tokens, {b.emails_used} emails.")
+    await add_task_from_text(ctx.user, ctx.chat_id, ctx.args)
+
+
+# ------------------------------------------------------------ settings
+async def cmd_timezone(ctx: Ctx) -> None:
+    hours = " and ".join(f"{h:02d}:00" for h in summary_hours())
+    if not ctx.args:
+        now_local = fmt_local(utcnow(), ctx.user, "%H:%M")
+        await reply(
+            ctx.chat_id,
+            f"🕐 Your timezone: {escape_markdown(user_tz_name(ctx.user))} (now {now_local}). Summaries at {hours}.\n\n"
+            "Change it: /timezone <zone>, e.g. `/timezone Europe/Berlin`, `/timezone Jakarta`, `/timezone +7`",
+        )
+        return
+    tz = parse_timezone(ctx.args)
+    if tz is None:
+        await reply(ctx.chat_id, "Unknown timezone. Try e.g. `Europe/Berlin`, `Asia/Jakarta`, `New York` or `+7`.")
+        return
+    store = get_store()
+    updated = ctx.user.model_copy(update={"timezone": tz})
+    now = utcnow()
+    # Don't fire an extra summary right away just because the clock moved: start with the next slot.
+    await store.update_user(ctx.user.id, {"timezone": tz, "last_run_slot": current_slot(now, user_tz(updated))})
+    next_local = fmt_local(next_slot(now, user_tz(updated)), updated, "%b %d %H:%M")
+    await reply(
+        ctx.chat_id,
+        f"✅ Timezone set to {escape_markdown(tz)} (now {fmt_local(now, updated, '%H:%M')}). "
+        f"Summaries at {hours}; the next one at {next_local}.",
+    )
+
+
+async def cmd_deleteme(ctx: Ctx) -> None:
+    store = get_store()
+    if ctx.user.is_admin:
+        others = [u for u in await store.list_users() if u.id != ctx.user.id and u.is_active]
+        if others:
+            await reply(
+                ctx.chat_id,
+                "You are the administrator. Make another user the admin first with /transferadmin <user id> "
+                "(see /users), then delete your account.",
+            )
+            return
+    if ctx.args.strip().upper() != "YES":
+        await reply(
+            ctx.chat_id,
+            "⚠️ This permanently deletes your Lola account: linked Google accounts (access is revoked), "
+            "drafts, promises, settings and your API key. Drafts already in Gmail stay there.\n\n"
+            "To confirm, send: `/deleteme YES`",
+        )
+        return
+    accounts = await store.delete_user(ctx.user.id)
+    for acc in accounts:
+        await revoke_token(acc.refresh_token)
+    await reply(
+        ctx.chat_id,
+        f"👋 Your account and all data were deleted ({len(accounts)} Google account(s) disconnected). "
+        + ("The bot is reset: the next person to send /start becomes the admin." if ctx.user.is_admin
+           else "To use Lola again you'll need a new invitation."),
+    )
+
+
+# ------------------------------------------------------------ own LLM key
+def _providers_text() -> str:
+    return "\n".join(
+        f"• `{p.name}` — {p.label}, default model `{p.default_model}` — key: {escape_markdown(p.key_url)}"
+        for p in PROVIDERS.values()
+    )
+
+
+SETKEY_USAGE = (
+    "Usage: /setkey <provider> <api key> [model]\n"
+    "Example: /setkey gemini AIza... gemini-2.5-flash\n\n"
+    "Providers:\n"
+)
+
+
+async def cmd_llm(ctx: Ctx) -> None:
+    st = await usage_status(ctx.user)
+    if st.own_key:
+        lines = [f"🤖 Using *your own* {st.provider} key (`{st.model}`) — no limits.", "/removekey to switch back to the shared assistant."]
     else:
-        pct = min(100, round(100 * b.tokens_used / b.token_limit)) if b.token_limit else 0
-        lines.append(f"Used this period: {b.tokens_used:,} / {b.token_limit:,} tokens ({pct}%)")
-        lines.append(f"Emails analysed: {b.emails_used} / {b.email_limit}")
-        if b.exhausted:
-            lines.append("⏳ Limit reached — drafts, /rewrite, /chat and /raw are paused until the next run.")
-    when = b.resets_at.strftime("%b %d %H:%M UTC") if b.resets_at else "next scheduled run"
-    lines.append(f"🔄 New period: {when}")
-    if not llm.own_key:
-        lines.append("\nUse your own API key without limits: /setkey")
+        provider = f"{st.provider} (`{st.model}`)" if st.provider else "not configured"
+        lines = [f"🤖 Using the shared assistant: {provider}"]
+        if st.limit is None:
+            lines.append("Limit: unlimited")
+        else:
+            pct = min(100, round(100 * st.used / st.limit)) if st.limit else 100
+            resets = f" at {fmt_local(st.resets_by, ctx.user, '%H:%M')}" if st.resets_by else ""
+            lines.append(f"Used this period: {_fmt_tokens(st.used)} / {_fmt_tokens(st.limit)} tokens ({pct}%)")
+            lines.append(f"Resets with your next summary{resets}.")
+            lines.append("When the limit is used up, drafting and questions pause until then; summaries keep coming.")
+        lines.append("\nUse your own API key without limits:\n/setkey <provider> <api key> [model]\n\n" + _providers_text())
     await reply(ctx.chat_id, "\n".join(lines))
 
 
 async def cmd_setkey(ctx: Ctx) -> None:
     parts = ctx.args.split()
-    if len(parts) < 2:
-        await reply(
-            ctx.chat_id,
-            "🔑 Use your own AI key — no limits, billed to your account.\n\n"
-            "Usage: /setkey <provider> <api key> [model]\n\n"
-            f"Providers:\n{_providers_help()}\n\n"
-            "Example: `/setkey gemini AIza... gemini-2.5-flash`\n"
-            "I delete your message right away and store the key encrypted.",
-        )
+    deleted = True
+    if len(parts) >= 2 and ctx.message_id:
+        # the message contains a secret: remove it from the chat history right away
+        deleted = await delete_message(config.settings.telegram_bot_token, ctx.chat_id, ctx.message_id)
+    if len(parts) < 2 or len(parts) > 3:
+        await reply(ctx.chat_id, SETKEY_USAGE + _providers_text())
         return
-    # the message contains a secret: remove it from the chat history immediately
-    if ctx.message_id:
-        await delete_message(config.settings.telegram_bot_token, ctx.chat_id, ctx.message_id)
-
     provider, api_key = parts[0].lower(), parts[1]
-    model = parts[2] if len(parts) > 2 else ""
+    model = parts[2] if len(parts) == 3 else ""
     if provider not in PROVIDERS:
         await reply(ctx.chat_id, f"Unknown provider. Choose one of: {', '.join(PROVIDERS)}")
         return
-    llm = user_llm(provider, api_key, model)
-    ok, problem = await check_key(llm)
-    if not ok:
-        await reply(ctx.chat_id, f"❌ Key not saved: {escape_markdown(problem)}.")
+    cfg = user_llm_config(provider, api_key, model)
+    try:
+        await chat_completion(cfg, [{"role": "user", "content": "Reply with OK"}], max_tokens=32)
+    except LLMError as exc:
+        reasons = {
+            401: "the key was rejected",
+            403: "the key was rejected",
+            404: f"model `{cfg.model}` was not found",
+            400: f"the request was rejected — check the model name `{cfg.model}`",
+            429: "the key has no quota or credit left",
+        }
+        await reply(ctx.chat_id, f"❌ Key check failed: {reasons.get(exc.status, escape_markdown(str(exc)[:150]))}. Nothing was saved.")
         return
-    await get_store().set_user_llm(ctx.user.id, provider, api_key, llm.model)
-    warning = f"\n⚠️ Note: {escape_markdown(problem)}." if problem else ""
-    await reply(
-        ctx.chat_id,
-        f"✅ Saved. I'll use {escape_markdown(llm.label)} with your key — no limits.{warning}\n"
-        "Your message with the key was deleted. /removekey to go back to the shared AI.",
+    await get_store().set_llm_key(ctx.user.id, UserLLMKey(provider=provider, model=model, api_key=api_key))
+    text = (
+        f"✅ Lola now uses your own {PROVIDERS[provider].label} key (`{cfg.model}`) — no limits. "
+        "The key is stored encrypted. /removekey to switch back to the shared assistant."
     )
+    if not deleted:
+        text += "\n\n⚠️ I couldn't delete your message with the key — please delete it yourself."
+    await reply(ctx.chat_id, text)
 
 
 async def cmd_removekey(ctx: Ctx) -> None:
-    removed = await get_store().delete_user_llm(ctx.user.id)
+    removed = await get_store().delete_llm_key(ctx.user.id)
     if removed:
-        await reply(ctx.chat_id, "✅ Your API key was deleted. Back to the shared AI (with limits). See /usage.")
+        limit = effective_limit(ctx.user)
+        limit_text = "unlimited" if limit is None else f"{_fmt_tokens(limit)} tokens per 12h"
+        await reply(ctx.chat_id, f"✅ Your API key was deleted. Back to the shared assistant ({limit_text}).")
     else:
-        await reply(ctx.chat_id, "You don't have your own API key set. See /setkey.")
+        await reply(ctx.chat_id, "You don't have your own API key set. See /llm.")
 
 
 # ------------------------------------------------------------- admin commands
 async def cmd_invite(ctx: Ctx) -> None:
     invite = await get_store().create_invite(created_by=ctx.user.id, note=ctx.args[:100])
     username = config.settings.telegram_bot_username or await get_bot_username(config.settings.telegram_bot_token)
-    expires = invite.expires_at.strftime("%b %d %H:%M UTC")
+    expires = fmt_local(invite.expires_at, ctx.user)
     if username:
         link = f"https://t.me/{username}?start={invite.code}"
         await reply(
@@ -506,7 +825,7 @@ async def cmd_invites(ctx: Ctx) -> None:
     lines = ["✉️ Active invitations:\n"]
     for inv in invites:
         note = f" — {escape_markdown(inv.note)}" if inv.note else ""
-        lines.append(f"`{inv.code}`{note} (until {inv.expires_at.strftime('%b %d %H:%M UTC')})")
+        lines.append(f"`{inv.code}`{note} (until {fmt_local(inv.expires_at, ctx.user)})")
     lines.append("\nCancel with /revoke <code>.")
     await reply(ctx.chat_id, "\n".join(lines))
 
@@ -527,7 +846,14 @@ async def cmd_users(ctx: Ctx) -> None:
         n_acc = len(await store.list_accounts(user_id=u.id, enabled_only=False))
         role = "👑" if u.is_admin else "👤"
         status = "" if u.is_active else " ⛔ disabled"
-        lines.append(f"{role} `{u.id}` {escape_markdown(u.display_name)} — {n_acc} account(s){status}")
+        st = await usage_status(u)
+        if st.own_key:
+            ai = f"own {st.provider} key"
+        elif st.limit is None:
+            ai = f"AI {_fmt_tokens(st.used)} (unlimited)"
+        else:
+            ai = f"AI {_fmt_tokens(st.used)}/{_fmt_tokens(st.limit)}"
+        lines.append(f"{role} `{u.id}` {escape_markdown(u.display_name)} — {n_acc} account(s), {ai}{status}")
     await reply(ctx.chat_id, "\n".join(lines))
 
 
@@ -576,6 +902,57 @@ async def cmd_remove(ctx: Ctx) -> None:
         )
 
 
+def _parse_limit(value: str) -> int | None | str:
+    """'default' -> None, 'unlimited'/'0' -> 0, '200k' / '200000' -> int; invalid -> 'invalid'."""
+    v = value.strip().lower().replace("_", "").replace(",", "")
+    if v == "default":
+        return None
+    if v in ("unlimited", "0"):
+        return 0
+    mult = 1_000 if v.endswith("k") else 1_000_000 if v.endswith("m") else 1
+    v = v.rstrip("km")
+    return int(float(v) * mult) if v.replace(".", "", 1).isdigit() and float(v) > 0 else "invalid"
+
+
+async def cmd_setlimit(ctx: Ctx) -> None:
+    usage = "Usage: /setlimit <user id> <tokens|default|unlimited>\nExample: /setlimit 123456 300k"
+    parts = ctx.args.split()
+    if len(parts) != 2 or not parts[0].lstrip("-").isdigit():
+        await reply(ctx.chat_id, usage)
+        return
+    limit = _parse_limit(parts[1])
+    if limit == "invalid":
+        await reply(ctx.chat_id, usage)
+        return
+    store = get_store()
+    target = await store.get_user(int(parts[0]))
+    if target is None:
+        await reply(ctx.chat_id, "No such user. See /users.")
+        return
+    await store.update_user(target.id, {"token_limit": limit})
+    if limit == 0:
+        shown = "unlimited"
+    else:
+        tokens = config.settings.user_token_limit if limit is None else limit
+        shown = f"{_fmt_tokens(tokens)} tokens per 12h" + (" (default)" if limit is None else "")
+    note = " — note: admins are never limited" if target.is_admin else ""
+    await reply(ctx.chat_id, f"✅ AI limit for {escape_markdown(target.display_name)}: {shown}{note}.")
+
+
+async def cmd_transferadmin(ctx: Ctx) -> None:
+    target = await _target_user(ctx, "Usage: /transferadmin <user id>")
+    if target is None:
+        return
+    if not target.is_active:
+        await reply(ctx.chat_id, "That user is disabled. /enable them first.")
+        return
+    if not await get_store().transfer_admin(ctx.user.id, target.id):
+        await reply(ctx.chat_id, "❌ Could not transfer the admin role.")
+        return
+    await reply(ctx.chat_id, f"✅ {escape_markdown(target.display_name)} is now the administrator. You are a regular user.")
+    await reply(target.chat_id, "👑 You are now the administrator of Lola. Send /help to see admin commands.")
+
+
 Handler = Callable[[Ctx], Awaitable[None]]
 
 USER_COMMANDS: dict[str, Handler] = {
@@ -584,12 +961,21 @@ USER_COMMANDS: dict[str, Handler] = {
     "/connect": cmd_connect,
     "/accounts": cmd_accounts,
     "/disconnect": cmd_disconnect,
+    "/focus": cmd_focus,
+    "/tasks": cmd_tasks,
+    "/task": cmd_task,
+    "/unlink": cmd_unlink,
+    "/draft": cmd_draft,
+    "/sent": cmd_sent,
+    "/deletedraft": cmd_deletedraft,
+    "/timezone": cmd_timezone,
+    "/deleteme": cmd_deleteme,
     "/status": cmd_status,
     "/drafts": cmd_drafts,
     "/rewrite": cmd_rewrite,
     "/raw": cmd_raw,
     "/chat": cmd_chat,
-    "/usage": cmd_usage,
+    "/llm": cmd_llm,
     "/setkey": cmd_setkey,
     "/removekey": cmd_removekey,
 }
@@ -602,4 +988,6 @@ ADMIN_COMMANDS: dict[str, Handler] = {
     "/disable": cmd_disable,
     "/enable": cmd_enable,
     "/remove": cmd_remove,
+    "/setlimit": cmd_setlimit,
+    "/transferadmin": cmd_transferadmin,
 }

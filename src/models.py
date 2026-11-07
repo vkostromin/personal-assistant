@@ -15,17 +15,50 @@ class Draft(BaseModel):
     body: str
     thread_id: Optional[str] = None
     original_email_id: Optional[str] = None
+    in_reply_to: Optional[str] = None  # Message-ID header of the email being answered
+    priority: str = "medium"  # high | medium | low
     created_at: datetime
-    status: str = "pending"
+    status: str = "pending"  # pending | sent | discarded
 
 
-class Promise(BaseModel):
-    text: str
-    source: str
-    source_detail: Optional[str] = None
-    created_at: datetime
-    status: str = "open"
-    account: Optional[str] = None
+ItemKind = Literal["promise", "waiting", "reply", "todo"]
+Priority = Literal["high", "medium", "low"]
+
+
+class Item(BaseModel):
+    """Something that needs attention: the core of "what should I do now".
+
+    kind:
+      promise — I promised someone to do something (outbound)
+      waiting — someone promised me / owes me an answer (inbound)
+      reply   — someone needs an answer from me and there's no draft (e.g. Chat question)
+      todo    — anything else I need to do (manual tasks, action items)
+    """
+
+    id: str = ""
+    user_id: int
+    kind: ItemKind
+    title: str
+    counterparty: str = ""
+    due_at: Optional[datetime] = None
+    priority: Priority = "medium"
+    status: Literal["open", "done", "cancelled"] = "open"
+    source: Literal["email", "sent", "chat", "manual"] = "manual"
+    account: str = ""
+    thread_id: Optional[str] = None  # Gmail thread
+    in_reply_to: Optional[str] = None  # Message-ID to answer when following up
+    subject: str = ""
+    space: Optional[str] = None  # Google Chat space name
+    link: str = ""
+    detail: str = ""
+    snoozed_until: Optional[datetime] = None
+    next_remind_at: Optional[datetime] = None
+    remind_stage: int = 0  # see src/items.py
+    last_reminded_at: Optional[datetime] = None
+    fingerprint: str = ""
+    resolution: str = ""
+    created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
+    closed_at: Optional[datetime] = None
 
 
 class User(BaseModel):
@@ -38,6 +71,14 @@ class User(BaseModel):
     role: Literal["admin", "user"] = "user"
     status: Literal["active", "disabled"] = "active"
     invited_by: Optional[int] = None
+    # Shared-LLM token limit per usage window: None = default (USER_TOKEN_LIMIT), 0 = unlimited
+    token_limit: Optional[int] = None
+    # IANA name ("Asia/Jakarta") or fixed offset ("+05:30"); "" = DEFAULT_TIMEZONE
+    timezone: str = ""
+    # Last summary slot (UTC) this user was processed for — see src/schedule.py
+    last_run_slot: Optional[datetime] = None
+    # Waiting for free text from the user, e.g. {"type": "rewrite", "ref": draft_id, "expires_at": ...}
+    pending_action: Optional[dict] = None
     created_at: datetime = Field(default_factory=utcnow)
 
     @property
@@ -64,10 +105,20 @@ class Account(BaseModel):
     providers: list[str] = ["gmail", "chat"]
     enabled: bool = True
     needs_reauth: bool = False
+    google_sub: str = ""  # Google account id (= Chat "users/{id}"), to recognise my own Chat messages
     last_run: Optional[datetime] = None  # last time any provider was checked successfully
     provider_last_run: dict[str, datetime] = {}  # per provider ("gmail"/"chat") watermark
     created_at: datetime = Field(default_factory=utcnow)
     chat_id: Optional[int] = None  # legacy field from the single-user version
+
+
+class UserLLMKey(BaseModel):
+    """A user's own LLM API key (stored encrypted in llm_keys/{user_id})."""
+
+    provider: str
+    model: str = ""
+    api_key: str
+    created_at: datetime = Field(default_factory=utcnow)
 
 
 class Invite(BaseModel):
@@ -89,19 +140,6 @@ class OAuthState(BaseModel):
     redirect_uri: str
     created_at: datetime = Field(default_factory=utcnow)
     expires_at: datetime
-
-
-class ChatSummary(BaseModel):
-    space_name: str
-    missed_questions: list[str]
-    promises: list[Promise]
-    summary_items: list[str]
-
-
-class EmailSummary(BaseModel):
-    drafts: list[Draft]
-    promises: list[Promise]
-    summary_items: list[str]
 
 
 class GlobalState(BaseModel):

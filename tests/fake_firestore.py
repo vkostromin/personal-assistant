@@ -11,6 +11,7 @@ import itertools
 from datetime import datetime, timezone
 
 from google.api_core import exceptions
+from google.cloud.firestore_v1.transforms import Increment
 
 _ids = itertools.count(1)
 
@@ -54,11 +55,14 @@ class FakeDocRef:
         return FakeSnapshot(self, self._docs.get(self.id))
 
     def _set(self, data, merge=False):
-        data = _normalize(copy.deepcopy(data))
-        if merge and self.id in self._docs:
-            self._docs[self.id].update(data)
-        else:
-            self._docs[self.id] = data
+        current = self._docs.get(self.id, {}) if merge else {}
+        new = dict(current)
+        for key, value in data.items():
+            if isinstance(value, Increment):
+                new[key] = (current.get(key) or 0) + value.value
+            else:
+                new[key] = _normalize(copy.deepcopy(value))
+        self._docs[self.id] = new
 
     def _update(self, updates):
         if self.id not in self._docs:
@@ -69,7 +73,10 @@ class FakeDocRef:
             *parents, leaf = path.split(".")
             for p in parents:
                 target = target.setdefault(p, {})
-            target[leaf] = _normalize(copy.deepcopy(value))
+            if isinstance(value, Increment):
+                target[leaf] = (target.get(leaf) or 0) + value.value
+            else:
+                target[leaf] = _normalize(copy.deepcopy(value))
 
     def _create(self, data):
         if self.id in self._docs:
@@ -94,6 +101,8 @@ _OPS = {
     "!=": lambda a, b: a != b,
     "<": lambda a, b: a is not None and a < b,
     ">": lambda a, b: a is not None and a > b,
+    "<=": lambda a, b: a is not None and a <= b,
+    ">=": lambda a, b: a is not None and a >= b,
 }
 
 

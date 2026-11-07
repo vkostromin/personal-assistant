@@ -4,22 +4,23 @@
 -include .env
 export
 
-SUBSTITUTIONS = _TELEGRAM_BOT_TOKEN=$(TELEGRAM_BOT_TOKEN),_GEMINI_API_KEY=$(GEMINI_API_KEY),_GEMINI_MODEL=$(GEMINI_MODEL),_DEEPSEEK_API_KEY=$(DEEPSEEK_API_KEY),_DEEPSEEK_MODEL=$(DEEPSEEK_MODEL),_OPENAI_API_KEY=$(OPENAI_API_KEY),_OPENAI_MODEL=$(OPENAI_MODEL),_GOOGLE_CLIENT_ID=$(GOOGLE_CLIENT_ID),_GOOGLE_CLIENT_SECRET=$(GOOGLE_CLIENT_SECRET),_TOKEN_ENCRYPTION_KEY=$(TOKEN_ENCRYPTION_KEY),_TELEGRAM_WEBHOOK_SECRET=$(TELEGRAM_WEBHOOK_SECRET),_RUN_SECRET=$(RUN_SECRET),_PUBLIC_URL=$(PUBLIC_URL),_ADMIN_TELEGRAM_ID=$(ADMIN_TELEGRAM_ID),_TELEGRAM_BOT_USERNAME=$(TELEGRAM_BOT_USERNAME),_USER_TOKEN_LIMIT=$(USER_TOKEN_LIMIT),_USER_EMAIL_LIMIT=$(USER_EMAIL_LIMIT),_LIMIT_ADMINS=$(LIMIT_ADMINS)
-
 deploy:
-	gcloud builds submit --config=cloudbuild.yaml --project=$(PROJECT_ID) --substitutions=$(SUBSTITUTIONS)
+	gcloud builds submit --config=cloudbuild.yaml \
+		--project=$(PROJECT_ID) \
+		--substitutions=_TELEGRAM_BOT_TOKEN=$(TELEGRAM_BOT_TOKEN),_DEEPSEEK_API_KEY=$(DEEPSEEK_API_KEY),_GEMINI_API_KEY=$(GEMINI_API_KEY),_OPENAI_API_KEY=$(OPENAI_API_KEY),_USER_TOKEN_LIMIT=$(or $(USER_TOKEN_LIMIT),150000),_GOOGLE_CLIENT_ID=$(GOOGLE_CLIENT_ID),_GOOGLE_CLIENT_SECRET=$(GOOGLE_CLIENT_SECRET),_TOKEN_ENCRYPTION_KEY=$(TOKEN_ENCRYPTION_KEY),_TELEGRAM_WEBHOOK_SECRET=$(TELEGRAM_WEBHOOK_SECRET),_RUN_SECRET=$(RUN_SECRET),_PUBLIC_URL=$(PUBLIC_URL),_ADMIN_TELEGRAM_ID=$(ADMIN_TELEGRAM_ID),_TELEGRAM_BOT_USERNAME=$(TELEGRAM_BOT_USERNAME),_DEFAULT_TIMEZONE=$(or $(DEFAULT_TIMEZONE),UTC)
 
 setup-scheduler:
-	@echo "Updating Cloud Scheduler job with Cloud Run URL..."
+	@echo "Updating Cloud Scheduler job (hourly; users get summaries at 08:00/20:00 in their own timezone)..."
 	@URL=$$(gcloud run services describe personal-assistant --region=$(REGION) --format='value(status.url)' --project=$(PROJECT_ID)); \
 	gcloud scheduler jobs update http lola-run --location=$(REGION) --uri="$$URL/run" \
+		--schedule="0 * * * *" --time-zone="Etc/UTC" \
 		--update-headers=X-Run-Secret=$(RUN_SECRET) --attempt-deadline=300s --project=$(PROJECT_ID)
 	@echo "Scheduler job updated."
 
 setup-telegram:
 	@echo "Setting Telegram webhook..."
 	@URL=$$(gcloud run services describe personal-assistant --region=$(REGION) --format='value(status.url)' --project=$(PROJECT_ID)); \
-	curl -s "https://api.telegram.org/bot$(TELEGRAM_BOT_TOKEN)/setWebhook?url=$$URL/webhook&secret_token=$(TELEGRAM_WEBHOOK_SECRET)&drop_pending_updates=true"
+	curl -s "https://api.telegram.org/bot$(TELEGRAM_BOT_TOKEN)/setWebhook?url=$$URL/webhook&secret_token=$(TELEGRAM_WEBHOOK_SECRET)&drop_pending_updates=true&allowed_updates=%5B%22message%22,%22callback_query%22%5D"
 
 # Optional: let Firestore auto-delete expired "connect Google account" links
 setup-firestore-ttl:

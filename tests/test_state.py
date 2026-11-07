@@ -1,7 +1,7 @@
 from datetime import datetime, timedelta, timezone
 
 
-from src.models import Account, User
+from src.models import Account, Item, User
 from src.state import LinkResult, RedeemResult
 
 
@@ -92,12 +92,12 @@ async def test_records_are_isolated_per_user(store):
     await store.link_account(Account(email="b@x.com", user_id=2, refresh_token="t"))
     await store.save_draft(1, {"account": "a@x.com", "to": "z", "subject": "s1", "body": "b", "status": "pending"})
     await store.save_draft(2, {"account": "b@x.com", "to": "z", "subject": "s2", "body": "b", "status": "pending"})
-    await store.save_promise(1, {"text": "p1", "account": "a@x.com"})
-    await store.save_promise(2, {"text": "p2", "account": "b@x.com"})
+    await store.create_item(Item(user_id=1, kind="promise", title="p1", account="a@x.com"))
+    await store.create_item(Item(user_id=2, kind="promise", title="p2", account="b@x.com"))
 
     assert [a.email for a in await store.list_accounts(user_id=1)] == ["a@x.com"]
     assert [d["subject"] for d in await store.get_pending_drafts(1)] == ["s1"]
-    assert [p["text"] for p in await store.get_open_promises(2)] == ["p2"]
+    assert [i.title for i in await store.list_open_items(2)] == ["p2"]
 
 
 async def test_delete_account_and_user(store, fake_db):
@@ -106,11 +106,11 @@ async def test_delete_account_and_user(store, fake_db):
     await store.link_account(Account(email="b@x.com", user_id=2, refresh_token="t"))
     await store.save_draft(2, {"account": "a@x.com", "status": "pending"})
     await store.save_draft(2, {"account": "b@x.com", "status": "pending"})
-    await store.save_promise(2, {"text": "p", "account": "a@x.com"})
+    await store.create_item(Item(user_id=2, kind="todo", title="p", account="a@x.com"))
 
     await store.delete_account("a@x.com")
     assert [d["account"] for d in await store.get_pending_drafts(2)] == ["b@x.com"]
-    assert await store.get_open_promises(2) == []
+    assert await store.list_open_items(2) == []
 
     removed = await store.delete_user(2)
     assert [a.email for a in removed] == ["b@x.com"]
@@ -130,7 +130,8 @@ async def test_migrate_legacy_single_user_data(store, fake_db):
         "d1": {"account": "owner@x.com", "status": "pending"},
         "d2": {"account": "friend@x.com", "status": "pending"},
     }
-    fake_db.data["promises"] = {"p1": {"account": "friend@x.com", "status": "open"}}
+    fake_db.data["promises"] = {"p1": {"account": "friend@x.com", "status": "open", "text": "Send the deck",
+                                       "source": "email"}}
 
     assert await store.migrate_legacy() is True
     assert await store.get_admin_id() == 111
@@ -141,7 +142,9 @@ async def test_migrate_legacy_single_user_data(store, fake_db):
     assert (await store.get_account("friend@x.com")).user_id == 222
     assert [d["id"] for d in await store.get_pending_drafts(111)] == ["d1"]
     assert [d["id"] for d in await store.get_pending_drafts(222)] == ["d2"]
-    assert [p["id"] for p in await store.get_open_promises(222)] == ["p1"]
+    [item] = await store.list_open_items(222)  # legacy promise became an item
+    assert (item.kind, item.title, item.source, item.account) == ("promise", "Send the deck", "email", "friend@x.com")
+    assert "promises" not in fake_db.data or not fake_db.data["promises"]
 
     assert await store.migrate_legacy() is False  # idempotent
 
