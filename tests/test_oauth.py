@@ -9,12 +9,12 @@ from fastapi.testclient import TestClient
 from src.main import app
 from src.models import Account, User
 from src.oauth import OAuthError, build_auth_url, parse_id_token, pkce_challenge, providers_from_scopes, SCOPES
-from tests.conftest import BASE_URL
+from tests.conftest import BASE_URL, CLIENT_ID
 
 ALL_SCOPES = " ".join(SCOPES)
 
 
-def id_token(email="new@x.com", aud="test-client-id", iss="https://accounts.google.com", exp=None, verified=True):
+def id_token(email="new@x.com", aud=CLIENT_ID, iss="https://accounts.google.com", exp=None, verified=True):
     claims = {"iss": iss, "aud": aud, "email": email, "email_verified": verified, "exp": exp or int(time.time()) + 3600}
     seg = lambda d: base64.urlsafe_b64encode(json.dumps(d).encode()).rstrip(b"=").decode()  # noqa: E731
     return f"{seg({'alg': 'RS256'})}.{seg(claims)}.sig"
@@ -120,15 +120,15 @@ async def test_callback_for_disabled_user_is_refused(client, store, bob, token_r
 
 
 def test_parse_id_token_validation():
-    assert parse_id_token(id_token(), "test-client-id")["email"] == "new@x.com"
+    assert parse_id_token(id_token(), CLIENT_ID)["email"] == "new@x.com"
     with pytest.raises(OAuthError):
-        parse_id_token(id_token(aud="other"), "test-client-id")
+        parse_id_token(id_token(aud="other"), CLIENT_ID)
     with pytest.raises(OAuthError):
-        parse_id_token(id_token(iss="https://evil.example"), "test-client-id")
+        parse_id_token(id_token(iss="https://evil.example"), CLIENT_ID)
     with pytest.raises(OAuthError):
-        parse_id_token(id_token(exp=int(time.time()) - 3600), "test-client-id")
+        parse_id_token(id_token(exp=int(time.time()) - 3600), CLIENT_ID)
     with pytest.raises(OAuthError):
-        parse_id_token("garbage", "test-client-id")
+        parse_id_token("garbage", CLIENT_ID)
 
 
 def test_providers_from_scopes():
@@ -141,3 +141,17 @@ def test_auth_url_always_requests_refresh_token():
     q = parse_qs(urlparse(build_auth_url("cid", "https://x/cb", "st", "v")).query)
     assert q["access_type"] == ["offline"] and "consent" in q["prompt"][0]
     assert q["code_challenge_method"] == ["S256"]
+
+
+async def test_chat_send_permission_is_recorded(client, store, bob, token_response):
+    from src.chat_client import CHAT_SEND_SCOPE
+    assert CHAT_SEND_SCOPE in SCOPES
+    st = await store.create_oauth_state(bob.id, "v", f"{BASE_URL}/oauth/callback")
+    client.get(f"/oauth/callback?state={st.id}&code=c")
+    assert (await store.get_account("new@x.com")).chat_send is True
+
+    token_response["scope"] = ALL_SCOPES.replace(CHAT_SEND_SCOPE, "")  # user unticked "send messages"
+    st = await store.create_oauth_state(bob.id, "v", f"{BASE_URL}/oauth/callback")
+    client.get(f"/oauth/callback?state={st.id}&code=c")
+    acc = await store.get_account("new@x.com")
+    assert acc.chat_send is False and acc.providers == ["gmail", "chat"]

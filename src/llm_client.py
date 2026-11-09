@@ -15,6 +15,7 @@ from src.prompts import (
     ANALYZE_EMAILS,
     ANALYZE_SENT,
     ANSWER_QUESTION,
+    CHAT_REPLY,
     COMPOSE_SUMMARY,
     CONTEXT,
     FOLLOW_UP,
@@ -131,6 +132,7 @@ class ExtractedItem:
     due_at: datetime | None = None
     priority: str = "medium"
     original_email_id: str | None = None
+    message_ref: str | None = None  # Chat: "c3" = the message this item is about
 
 
 @dataclass
@@ -172,6 +174,7 @@ def _parse_items(raw, ctx: AnalysisContext, allowed_kinds: set[str] = _KINDS) ->
                 due_at=parse_due(d.get("due_at"), ctx.tz),
                 priority=priority if priority in _PRIORITIES else "medium",
                 original_email_id=str(d["original_email_id"]) if d.get("original_email_id") else None,
+                message_ref=str(d["message_ref"]) if d.get("message_ref") else None,
             )
         )
     return result
@@ -270,7 +273,8 @@ async def analyze_sent(messages: list[dict], account: str, llm: LLM, ctx: Analys
 
 
 async def analyze_chat(messages: list[dict], space_name: str, llm: LLM, ctx: AnalysisContext) -> Analysis:
-    formatted = "\n".join(f"[{m['time'][:16]}] {m['sender']}: {m['text']}" for m in messages)
+    # short refs (c1, c2…) instead of long Chat resource names, mapped back by the caller
+    formatted = "\n".join(f"[c{n} {m['time'][:16]}] {m['sender']}: {m['text']}" for n, m in enumerate(messages, 1))
     prompt = ANALYZE_CHAT.format(space_name=space_name, messages=formatted, context=ctx.render(), item_rules=ITEM_RULES)
     data = await _json_call(llm, prompt, "analyze_chat")
     if data is None:
@@ -294,6 +298,12 @@ async def parse_task(text: str, llm: LLM, ctx: AnalysisContext) -> ExtractedItem
 async def parse_due_text(text: str, llm: LLM, ctx: AnalysisContext) -> datetime | None:
     data = await _json_call(llm, PARSE_DUE.format(text=text[:200], now=ctx.now_text()), "parse_due")
     return parse_due(data.get("due_at"), ctx.tz) if data else None
+
+
+async def suggest_chat_reply(item: Item, llm: LLM) -> str:
+    prompt = CHAT_REPLY.format(title=item.title, counterparty=item.counterparty or "-", message=item.detail or "-")
+    content = await llm.complete([{"role": "user", "content": prompt}])
+    return content.strip().strip('"')
 
 
 async def write_follow_up(item: Item, due_text: str, llm: LLM, signature: str) -> dict | None:

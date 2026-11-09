@@ -5,7 +5,7 @@ from fastapi.testclient import TestClient
 
 from src import config
 from src.main import app
-from tests.conftest import make_settings
+from tests.conftest import RUN_SECRET, WEBHOOK_SECRET, make_settings
 
 
 @pytest.fixture
@@ -19,16 +19,16 @@ def use_settings(monkeypatch, **kw):
 
 class TestWebhookAuth:
     def test_webhook_rejects_missing_secret_header(self, client, monkeypatch):
-        use_settings(monkeypatch, telegram_webhook_secret="correct-secret")
+        use_settings(monkeypatch, telegram_webhook_secret=WEBHOOK_SECRET)
         response = client.post("/webhook", json={"message": {}})
         assert response.json() == {"ok": False}
 
     def test_webhook_rejects_wrong_secret(self, client, monkeypatch, outbox):
-        use_settings(monkeypatch, telegram_webhook_secret="correct-secret")
+        use_settings(monkeypatch, telegram_webhook_secret=WEBHOOK_SECRET)
         response = client.post(
             "/webhook",
             json={"message": {"chat": {"id": 123, "type": "private"}, "from": {"id": 123}, "text": "/start"}},
-            headers={"X-Telegram-Bot-Api-Secret-Token": "wrong-secret"},
+            headers={"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET + "-wrong"},
         )
         assert response.json() == {"ok": False}
         assert list(outbox) == []  # nothing processed
@@ -43,26 +43,26 @@ class TestWebhookAuth:
         assert response.json() == {"ok": True}
 
     def test_webhook_allows_correct_secret(self, client, monkeypatch, outbox):
-        use_settings(monkeypatch, telegram_webhook_secret="correct-secret")
+        use_settings(monkeypatch, telegram_webhook_secret=WEBHOOK_SECRET)
         response = client.post(
             "/webhook",
             json={"message": {"chat": {"id": 123, "type": "private"}, "from": {"id": 123}, "text": "/help"}},
-            headers={"X-Telegram-Bot-Api-Secret-Token": "correct-secret"},
+            headers={"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET},
         )
         assert response.json() == {"ok": True}
         assert outbox.to(123)
 
     def test_webhook_ignores_empty_body(self, client, monkeypatch):
-        use_settings(monkeypatch, telegram_webhook_secret="correct-secret")
-        response = client.post("/webhook", json={}, headers={"X-Telegram-Bot-Api-Secret-Token": "correct-secret"})
+        use_settings(monkeypatch, telegram_webhook_secret=WEBHOOK_SECRET)
+        response = client.post("/webhook", json={}, headers={"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET})
         assert response.json() == {"ok": True}
 
     def test_webhook_rejects_empty_chat_id(self, client, monkeypatch, outbox):
-        use_settings(monkeypatch, telegram_webhook_secret="correct-secret")
+        use_settings(monkeypatch, telegram_webhook_secret=WEBHOOK_SECRET)
         response = client.post(
             "/webhook",
             json={"message": {"text": "hello"}},
-            headers={"X-Telegram-Bot-Api-Secret-Token": "correct-secret"},
+            headers={"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET},
         )
         assert response.json() == {"ok": True}
         assert list(outbox) == []
@@ -70,16 +70,16 @@ class TestWebhookAuth:
 
 class TestRunAuth:
     def test_run_rejects_missing_secret_header(self, client, monkeypatch):
-        use_settings(monkeypatch, run_secret="correct-run-secret")
+        use_settings(monkeypatch, run_secret=RUN_SECRET)
         with patch("src.main.run_all_users", new_callable=AsyncMock) as run:
             response = client.post("/run")
         assert response.json() == {"status": "unauthorized"}
         run.assert_not_called()
 
     def test_run_rejects_wrong_secret(self, client, monkeypatch):
-        use_settings(monkeypatch, run_secret="correct-run-secret")
+        use_settings(monkeypatch, run_secret=RUN_SECRET)
         with patch("src.main.run_all_users", new_callable=AsyncMock) as run:
-            response = client.post("/run", headers={"X-Run-Secret": "wrong"})
+            response = client.post("/run", headers={"X-Run-Secret": RUN_SECRET + "-wrong"})
         assert response.json() == {"status": "unauthorized"}
         run.assert_not_called()
 
@@ -91,10 +91,10 @@ class TestRunAuth:
         assert response.json() == {"status": "ok"}
 
     def test_run_allows_correct_secret(self, client, monkeypatch):
-        use_settings(monkeypatch, run_secret="correct-run-secret")
+        use_settings(monkeypatch, run_secret=RUN_SECRET)
         with patch("src.main.run_all_users", new_callable=AsyncMock, return_value={"users": 2}), \
                 patch("src.main.run_reminders", new_callable=AsyncMock, return_value={"reminders": 1}):
-            response = client.post("/run", headers={"X-Run-Secret": "correct-run-secret"})
+            response = client.post("/run", headers={"X-Run-Secret": RUN_SECRET})
         assert response.json() == {"status": "ok", "users": 2, "reminders": 1}
 
 
@@ -104,7 +104,7 @@ class TestPublicUrl:
         client.post(
             "/webhook",
             json={"message": {"chat": {"id": 7, "type": "private"}, "from": {"id": 7}, "text": "/start"}},
-            headers={"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret", "Host": "svc-abc.a.run.app"},
+            headers={"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET, "Host": "svc-abc.a.run.app"},
         )
         url = outbox.last(7)[2]["inline_keyboard"][0][0]["url"]
         assert url.startswith("https://svc-abc.a.run.app/oauth/start?state=")

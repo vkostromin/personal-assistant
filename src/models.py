@@ -49,6 +49,8 @@ class Item(BaseModel):
     in_reply_to: Optional[str] = None  # Message-ID to answer when following up
     subject: str = ""
     space: Optional[str] = None  # Google Chat space name
+    chat_thread: Optional[str] = None  # Chat thread to reply in ("spaces/X/threads/Y")
+    chat_message: Optional[str] = None  # Chat message the item came from
     link: str = ""
     detail: str = ""
     snoozed_until: Optional[datetime] = None
@@ -57,6 +59,7 @@ class Item(BaseModel):
     last_reminded_at: Optional[datetime] = None
     fingerprint: str = ""
     resolution: str = ""
+    reviewed_at: Optional[datetime] = None  # last time the user handled it in /review
     created_at: datetime = Field(default_factory=lambda: datetime.now(timezone.utc))
     closed_at: Optional[datetime] = None
 
@@ -106,8 +109,12 @@ class Account(BaseModel):
     enabled: bool = True
     needs_reauth: bool = False
     google_sub: str = ""  # Google account id (= Chat "users/{id}"), to recognise my own Chat messages
+    chat_send: bool = False  # granted chat.messages.create → can reply to Chat from Telegram
     last_run: Optional[datetime] = None  # last time any provider was checked successfully
-    provider_last_run: dict[str, datetime] = {}  # per provider ("gmail"/"chat") watermark
+    provider_last_run: dict[str, datetime] = {}  # per provider ("gmail"/"gmail_sent"/"chat") watermark
+    # Gmail ids processed exactly at the watermark (messages sharing its internalDate), to skip next time
+    provider_seen_ids: dict[str, list[str]] = {}
+    backlog: bool = False  # a run stopped before all new mail was processed → continue next hour
     created_at: datetime = Field(default_factory=utcnow)
     chat_id: Optional[int] = None  # legacy field from the single-user version
 

@@ -13,9 +13,9 @@ from google.auth.exceptions import RefreshError
 
 from src import config
 from src.callbacks import add_task_from_text, handle_callback, handle_free_text
-from src.cards import draft_card, focus_message, numbered_keyboard, tasks_message
+from src.cards import draft_card, focus_message, numbered_keyboard, people_message, review_card, tasks_message, who_message
 from src.drafts_sync import sync_note, sync_user_drafts
-from src.items import rank_focus
+from src.items import matches_person, person_key, rank_focus, review_queue
 from src.gmail_client import check_drafts, delete_gmail_draft, update_gmail_draft
 from src.llm_client import LLM, LLMError, chat_completion, answer_question, rewrite_draft
 from src.models import User, UserLLMKey, utcnow
@@ -32,6 +32,8 @@ USER_HELP = (
     "🎯 /focus — what to do right now\n"
     "📋 /tasks — promises, waiting-for, replies, to-dos\n"
     "/task <text> — add a task (or just send / forward me any message)\n"
+    "👤 /who <name> — everything open with a person\n"
+    "🧹 /review — go through old items: done / cancel / remind again\n"
     "/status — current state\n"
     "/chat <question> — ask about your state\n"
     "/raw <text> — analyze text\n\n"
@@ -294,7 +296,8 @@ async def cmd_accounts(ctx: Ctx) -> None:
     for acc in accounts:
         status = "🔑 needs /connect" if acc.needs_reauth else ("⏸ disabled" if not acc.enabled else "✅")
         last = fmt_local(acc.last_run, ctx.user) if acc.last_run else "not checked yet"
-        lines.append(f"{status} {escape_markdown(acc.email)} — {', '.join(acc.providers) or 'nothing'} — {last}")
+        reply_note = " (↩️ replies: /connect again)" if "chat" in acc.providers and not acc.chat_send else ""
+        lines.append(f"{status} {escape_markdown(acc.email)} — {', '.join(acc.providers) or 'nothing'}{reply_note} — {last}")
     lines.append(
         "\n/connect to add another (or to re-enable Gmail/Chat), /unlink <email> <gmail|chat> to stop using one, "
         "/disconnect <email> to remove."
@@ -662,6 +665,40 @@ async def cmd_task(ctx: Ctx) -> None:
     await add_task_from_text(ctx.user, ctx.chat_id, ctx.args)
 
 
+async def cmd_who(ctx: Ctx) -> None:
+    store = get_store()
+    now = utcnow()
+    items = await store.list_open_items(ctx.user.id)
+    drafts = await store.get_pending_drafts(ctx.user.id)
+    query = ctx.args.strip()
+    if not query:
+        await reply(ctx.chat_id, people_message(items, drafts, now))
+        return
+    # match the query, then include everything with the same person (same email), e.g.
+    # "/who alex smith" also finds items where the counterparty is just "alex@x.com"
+    keys = {person_key(i.counterparty) for i in items if matches_person(query, i.counterparty)}
+    keys |= {person_key(d.get("to", "")) for d in drafts if matches_person(query, d.get("to", ""))}
+    keys.discard("")
+    text, markup = who_message(
+        query,
+        [i for i in items if person_key(i.counterparty) in keys],
+        [d for d in drafts if person_key(d.get("to", "")) in keys],
+        ctx.user,
+        now,
+    )
+    await reply(ctx.chat_id, text, markup)
+
+
+async def cmd_review(ctx: Ctx) -> None:
+    now = utcnow()
+    queue = review_queue(await get_store().list_open_items(ctx.user.id), now)
+    if not queue:
+        await reply(ctx.chat_id, "🎉 Nothing to review — no old or forgotten items.")
+        return
+    text, markup = review_card(queue[0], ctx.user, now, left=len(queue))
+    await reply(ctx.chat_id, text, markup)
+
+
 # ------------------------------------------------------------ settings
 async def cmd_timezone(ctx: Ctx) -> None:
     hours = " and ".join(f"{h:02d}:00" for h in summary_hours())
@@ -964,6 +1001,8 @@ USER_COMMANDS: dict[str, Handler] = {
     "/focus": cmd_focus,
     "/tasks": cmd_tasks,
     "/task": cmd_task,
+    "/who": cmd_who,
+    "/review": cmd_review,
     "/unlink": cmd_unlink,
     "/draft": cmd_draft,
     "/sent": cmd_sent,

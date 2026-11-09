@@ -6,9 +6,9 @@ from src.llm_client import LLMError
 from src.main import app
 from src.models import Account, User, UserLLMKey
 from src.providers import server_llm_config
-from tests.conftest import make_settings
+from tests.conftest import WEBHOOK_HEADERS, make_settings
 
-HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"}
+HEADERS = WEBHOOK_HEADERS
 ADMIN, BOB = 1001, 2002
 
 

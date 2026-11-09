@@ -1,7 +1,16 @@
 import json
 import os
+from pathlib import Path
 
-os.environ.setdefault("PROJECT_ID", "test-project")
+from dotenv import dotenv_values
+
+_DIR = Path(__file__).parent
+# tests/.env (local, git-ignored) or the committed tests/.env.example
+ENV: dict[str, str] = {
+    k: v or ""
+    for k, v in dotenv_values(_DIR / ".env" if (_DIR / ".env").exists() else _DIR / ".env.example").items()
+}
+os.environ.setdefault("PROJECT_ID", ENV.get("PROJECT_ID", "test-project"))
 
 import pytest  # noqa: E402
 
@@ -9,26 +18,18 @@ from src import config, state  # noqa: E402
 from src.config import Settings  # noqa: E402
 from tests.fake_firestore import FakeAsyncClient  # noqa: E402
 
-BASE_URL = "https://lola.example.run.app"
+BASE_URL = ENV["PUBLIC_URL"]
+CLIENT_ID = ENV["GOOGLE_CLIENT_ID"]
+CLIENT_SECRET = ENV["GOOGLE_CLIENT_SECRET"]
+WEBHOOK_SECRET = ENV["TELEGRAM_WEBHOOK_SECRET"]
+RUN_SECRET = ENV["RUN_SECRET"]
+BOT_USERNAME = ENV["TELEGRAM_BOT_USERNAME"]
+WEBHOOK_HEADERS = {"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET}
 
 
 def make_settings(**overrides) -> Settings:
-    values = dict(
-        project_id="test-project",
-        google_client_id="test-client-id",
-        google_client_secret="test-client-secret",
-        token_encryption_key="test-encryption-key-1234567890123456",
-        telegram_webhook_secret="test-webhook-secret",
-        run_secret="test-run-secret",
-        telegram_bot_token="test-bot-token",
-        telegram_bot_username="lola_test_bot",
-        public_url=BASE_URL,
-        admin_telegram_id="",
-        gemini_api_key="server-gemini-key",
-        deepseek_api_key="",
-        openai_api_key="",
-        user_token_limit=150_000,
-    )
+    """Settings from the test env file only (the shell environment can't leak in), plus overrides."""
+    values = {k.lower(): v for k, v in ENV.items()}
     values.update(overrides)
     return Settings(_env_file=None, **values)
 
@@ -192,3 +193,52 @@ def gmail_drafts(monkeypatch):
     monkeypatch.setattr("src.bot.check_drafts", fake.check_drafts)
     monkeypatch.setattr("src.bot.delete_gmail_draft", fake.delete_gmail_draft)
     return fake
+
+
+class FakeMailbox:
+    """Gmail stand-in for list_message_ids / get_messages with real time filtering."""
+
+    def __init__(self):
+        self.messages: dict[tuple[str, str], list[dict]] = {}  # (email, "inbox"|"sent") -> messages
+        self.list_calls: list[dict] = []
+        self.get_calls: list[list[str]] = []
+        self.fail: dict[str, Exception] = {}  # email -> exception raised on listing
+        self._n = 0
+
+    def add(self, email, *, sent=False, at=None, count=1, **fields):
+        from datetime import datetime, timezone
+        at = at or datetime.now(timezone.utc)
+        added = []
+        for _ in range(count):
+            self._n += 1
+            msg = {"id": f"m{self._n}", "thread_id": f"t{self._n}", "internal_ms": int(at.timestamp() * 1000),
+                   "from": "x@y.com", "to": email, "subject": f"subject {self._n}", "date": "",
+                   "message_id_header": f"<m{self._n}@mail>", "body": "?"}
+            msg.update(fields)
+            self.messages.setdefault((email, "sent" if sent else "inbox"), []).append(msg)
+            added.append(msg)
+        return added
+
+    def list_message_ids(self, account, client_id, client_secret, since, sent=False, cap=None):
+        self.list_calls.append({"email": account.email, "since": since, "sent": sent, "cap": cap})
+        if account.email in self.fail and not sent:
+            raise self.fail[account.email]
+        after_ms = (int(since.timestamp()) - 1) * 1000
+        msgs = [m for m in self.messages.get((account.email, "sent" if sent else "inbox"), []) if m["internal_ms"] > after_ms]
+        ids = [m["id"] for m in sorted(msgs, key=lambda m: m["internal_ms"], reverse=True)]
+        if cap is not None and len(ids) > cap:
+            return ids[:cap], True
+        return ids, False
+
+    def get_messages(self, account, client_id, client_secret, ids):
+        self.get_calls.append(list(ids))
+        everything = {m["id"]: m for msgs in self.messages.values() for m in msgs}
+        return sorted((dict(everything[i]) for i in ids if i in everything), key=lambda m: m["internal_ms"])
+
+
+@pytest.fixture
+def mailbox(monkeypatch):
+    box = FakeMailbox()
+    monkeypatch.setattr("src.runner.list_message_ids", box.list_message_ids)
+    monkeypatch.setattr("src.runner.get_messages", box.get_messages)
+    return box

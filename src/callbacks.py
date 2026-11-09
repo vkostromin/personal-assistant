@@ -7,6 +7,8 @@ from src import config
 from src.actions import (
     ActionError,
     add_item,
+    chat_reply_account,
+    send_chat_reply,
     close_item,
     discard_draft,
     follow_up,
@@ -21,6 +23,7 @@ from src.actions import (
 from src.cards import (
     button,
     cb,
+    chat_preview,
     draft_card,
     draft_keyboard,
     draft_text,
@@ -29,10 +32,23 @@ from src.cards import (
     item_keyboard,
     item_text,
     keyboard,
+    review_card,
+    review_due_keyboard,
+    review_keyboard,
     send_confirm_keyboard,
     snooze_keyboard,
 )
-from src.llm_client import LLM, AnalysisContext, ExtractedItem, LLMError, answer_question, parse_due_text, parse_task
+from src.llm_client import (
+    LLM,
+    AnalysisContext,
+    ExtractedItem,
+    LLMError,
+    answer_question,
+    parse_due_text,
+    parse_task,
+    suggest_chat_reply,
+)
+from src.items import next_reminder, review_queue
 from src.models import User, utcnow
 from src.quota import LLMUnavailable, QuotaExceeded, get_llm, limit_reached_text, usage_status
 from src.schedule import fmt_local, user_tz, user_tz_name
@@ -100,6 +116,8 @@ async def handle_callback(cq: dict) -> None:
             toast = await _draft_action(user, msg, action, ref, arg)
         elif kind == "t":
             toast = await _text_action(user, msg, action)
+        elif kind == "r":
+            toast = await _review_action(user, msg, action, ref, arg)
     except ActionError as exc:
         toast = str(exc)[:190]
         await _send(chat_id, f"❌ {escape_markdown(str(exc))}")
@@ -157,10 +175,101 @@ async def _item_action(user: User, msg: _Msg, action: str, ref: str, arg: str) -
         text, markup = draft_card(draft, user, now, header="✍️ Follow-up draft — check it and send:")
         await _send(msg.chat_id, text, markup)
         return "Follow-up drafted"
+    if action == "crep":
+        await chat_reply_account(user, item)  # explains how to fix it if replying isn't possible
+        await store.set_pending_action(user.id, {"type": "chat_reply", "ref": item.id, "expires_at": now + PENDING_TTL})
+        await _send(
+            msg.chat_id,
+            "↩️ Type your reply — it will be posted in Google Chat as you (you'll see it before it's sent).",
+            keyboard([button("✨ Let Lola draft it", cb("i", "csug", item.id))]),
+        )
+        return ""
+    if action == "csug":
+        await chat_reply_account(user, item)
+        llm = await _llm(user, msg.chat_id)
+        if llm is None:
+            return ""
+        await show_chat_preview(user, msg.chat_id, item, await suggest_chat_reply(item, llm))
+        return "Draft ready"
+    if action == "csend":
+        pending = user.pending_action or {}
+        expires = _aware(pending.get("expires_at"))
+        if pending.get("type") != "chat_confirm" or pending.get("ref") != item.id or not expires or expires < now:
+            await msg.edit(markup=None)
+            return "Expired — tap ↩️ Reply again."
+        await send_chat_reply(user, item, pending["text"])
+        await store.set_pending_action(user.id, None)
+        await msg.edit(chat_preview(item, pending["text"])[0] + "\n\n📤 *Sent*")
+        return "Sent to Chat"
+    if action == "cx":
+        await store.set_pending_action(user.id, None)
+        await msg.edit(markup=None)
+        return "Not sent"
     if action == "back":
         await msg.edit(markup=item_keyboard(item))
         return ""
     return ""
+
+
+async def _review_action(user: User, msg: _Msg, action: str, ref: str, arg: str) -> str:
+    """One /review step: act on the item, then show the next old item in the same message."""
+    store = get_store()
+    now = utcnow()
+    item = await store.get_item(ref)
+    if item is None or item.user_id != user.id:
+        await msg.edit(markup=None)
+        return "Item not found."
+    if action == "stop":
+        await msg.edit("🧹 Review paused. Send /review to continue.")
+        return ""
+    if action == "back":
+        await msg.edit(markup=review_keyboard(item))
+        return ""
+    toast = ""
+    if item.status == "open":
+        if action in ("done", "cancel"):
+            await close_item(user, item, "done" if action == "done" else "cancelled", resolution="in review")
+            toast = "Done ✅" if action == "done" else "Cancelled"
+        elif action == "again" or (action == "due" and not arg):
+            if action == "again" and item.due_at:
+                # restart the reminder policy: heads-up/due/3 daily reminders again
+                fresh = item.model_copy(update={"remind_stage": 0, "last_reminded_at": None, "snoozed_until": None})
+                await store.update_item(item.id, {
+                    "remind_stage": 0, "last_reminded_at": None, "snoozed_until": None, "reviewed_at": now,
+                    "next_remind_at": next_reminder(fresh, now, user_tz(user)),
+                })
+                toast = "Reminders restarted"
+            else:
+                await msg.edit(markup=review_due_keyboard(item.id))
+                return "Pick a deadline" if action == "again" else ""
+        elif action == "due":
+            await set_due_choice(user, item, arg)
+            await store.update_item(item.id, {"reviewed_at": now})
+            toast = "Deadline updated"
+        elif action == "skip":
+            toast = "Skipped"
+    await _show_next_review(user, msg, after=item)
+    return toast
+
+
+async def _show_next_review(user: User, msg: _Msg, after) -> None:
+    now = utcnow()
+    key = (_aware(after.created_at), after.id)
+    queue = [i for i in review_queue(await get_store().list_open_items(user.id), now) if (_aware(i.created_at), i.id) > key]
+    if not queue:
+        await msg.edit("🎉 Review finished — everything old has a decision.")
+        return
+    text, markup = review_card(queue[0], user, now, left=len(queue))
+    await msg.edit(text, markup)
+
+
+async def show_chat_preview(user: User, chat_id: int, item, text: str) -> None:
+    """Ask for confirmation before posting to Google Chat."""
+    await get_store().set_pending_action(
+        user.id, {"type": "chat_confirm", "ref": item.id, "text": text[:4000], "expires_at": utcnow() + PENDING_TTL}
+    )
+    preview, markup = chat_preview(item, text)
+    await _send(chat_id, preview, markup)
 
 
 async def _draft_action(user: User, msg: _Msg, action: str, ref: str, arg: str) -> str:
@@ -276,6 +385,14 @@ async def handle_free_text(user: User, chat_id: int, text: str) -> None:
     now = utcnow()
     pending = user.pending_action or {}
     expires = _aware(pending.get("expires_at"))
+    if pending.get("type") == "chat_reply" and expires and expires > now:
+        item = await store.get_item(pending["ref"])
+        if item is None or item.user_id != user.id or item.status != "open":
+            await store.set_pending_action(user.id, None)
+            await _send(chat_id, "That item is no longer open. See /tasks.")
+            return
+        await show_chat_preview(user, chat_id, item, text)
+        return
     if pending.get("type") in ("rewrite", "due") and expires and expires > now:
         await store.set_pending_action(user.id, None)
         llm = await _llm(user, chat_id)

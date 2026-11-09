@@ -8,7 +8,7 @@ from fastapi.responses import HTMLResponse
 from src import config
 from src.bot import handle_update, reply
 from src.models import Account
-from src.oauth import OAuthError, build_auth_url, exchange_code, parse_id_token, providers_from_scopes
+from src.oauth import OAuthError, build_auth_url, can_send_chat, exchange_code, parse_id_token, providers_from_scopes
 from src.reminders import run_reminders
 from src.runner import run_all_users
 from src.schedule import user_tz_name
@@ -175,7 +175,10 @@ async def oauth_callback(state: str = "", code: str = "", error: str = ""):
         return _page("Account not linked", f"<p>{html.escape(problem)}</p>", 400)
 
     result = await store.link_account(
-        Account(email=email, user_id=user.id, refresh_token=refresh_token, providers=providers, google_sub=str(claims.get("sub", "")))
+        Account(
+            email=email, user_id=user.id, refresh_token=refresh_token, providers=providers,
+            google_sub=str(claims.get("sub", "")), chat_send="chat" in providers and can_send_chat(tokens.get("scope", "")),
+        )
     )
     if result == LinkResult.TAKEN:
         await reply(user.chat_id, f"❌ {escape_markdown(email)} is already linked to another user.")

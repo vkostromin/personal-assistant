@@ -6,8 +6,9 @@ from fastapi.testclient import TestClient
 from src.main import app
 from src.models import Account, Item, User, utcnow
 from src.reminders import run_reminders
+from tests.conftest import WEBHOOK_HEADERS
 
-HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"}
+HEADERS = WEBHOOK_HEADERS
 BOB, EVE = 2002, 3003
 UTC = timezone.utc
 

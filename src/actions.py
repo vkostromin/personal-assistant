@@ -4,7 +4,10 @@ import asyncio
 import logging
 from datetime import datetime, timedelta
 
+from google.auth.exceptions import RefreshError
+
 from src import config
+from src.chat_client import send_chat_message
 from src.gmail_client import create_draft, delete_gmail_draft, send_draft, update_gmail_draft
 from src.items import due_choice, fingerprint, next_reminder, snooze_until
 from src.llm_client import LLM, ExtractedItem, ItemUpdate, rewrite_draft, write_follow_up
@@ -21,7 +24,8 @@ class ActionError(Exception):
 
 # -------------------------------------------------------------------- items
 async def add_item(user: User, extracted: ExtractedItem, *, source: str, account: str = "",
-                   message: dict | None = None, space: dict | None = None, link: str = "") -> Item | None:
+                   message: dict | None = None, space: dict | None = None, link: str = "",
+                   chat_message: dict | None = None) -> Item | None:
     """Create an item (deduplicated against open items). Returns None if it already exists."""
     store = get_store()
     now = utcnow()
@@ -45,6 +49,9 @@ async def add_item(user: User, extracted: ExtractedItem, *, source: str, account
         in_reply_to=(message or {}).get("message_id_header") or None,
         subject=(message or {}).get("subject", "")[:200],
         space=(space or {}).get("name"),
+        chat_thread=(chat_message or {}).get("thread") or None,
+        chat_message=(chat_message or {}).get("name") or None,
+        detail=((chat_message or {}).get("text") or "")[:500],
         link=link,
         fingerprint=fp,
         created_at=now,
@@ -100,6 +107,33 @@ async def _owned_account(user: User, email: str) -> Account:
     if account.needs_reauth:
         raise ActionError(f"Access to {email} expired — send /connect to reconnect it.")
     return account
+
+
+async def chat_reply_account(user: User, item: Item) -> Account:
+    """The account to reply from; raises ActionError with what to do if replying isn't possible."""
+    if not item.space or not item.account:
+        raise ActionError("This item isn't from Google Chat.")
+    account = await _owned_account(user, item.account)
+    if not account.chat_send:
+        raise ActionError(
+            f"Replying from Telegram needs one more permission. Send /connect and sign in with {account.email} again."
+        )
+    return account
+
+
+async def send_chat_reply(user: User, item: Item, text: str) -> None:
+    s = config.settings
+    account = await chat_reply_account(user, item)
+    try:
+        sent = await asyncio.to_thread(
+            send_chat_message, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret,
+            space=item.space, text=text, thread=item.chat_thread,
+        )
+    except RefreshError as exc:
+        raise ActionError(f"Access to {account.email} expired — send /connect to reconnect it.") from exc
+    if not sent:
+        raise ActionError("Google Chat refused the message.")
+    await close_item(user, item, "done", "replied from Telegram")
 
 
 async def follow_up(user: User, item: Item, llm: LLM) -> dict:

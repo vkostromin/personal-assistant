@@ -8,7 +8,7 @@ from datetime import datetime, timezone
 
 from src.chat_client import space_link
 from src.gmail_client import drafts_link, thread_link
-from src.items import KIND_LABEL, PRIORITY_ICON, FocusEntry
+from src.items import KIND_LABEL, PRIORITY_ICON, FocusEntry, person_key
 from src.models import Item, User
 from src.schedule import fmt_local
 from src.telegram_client import escape_markdown as esc
@@ -80,6 +80,8 @@ def item_text(item: Item, user: User, now: datetime) -> str:
     snoozed = _aware(item.snoozed_until)
     if snoozed and snoozed > now:
         lines.append(f"⏰ snoozed until {fmt_local(snoozed, user, '%a %H:%M')}")
+    if item.detail and item.source == "chat":
+        lines.append(f"“{esc(item.detail[:300])}”")
     origin = {"email": "📧 from email", "sent": "📤 from my email", "chat": "💬 from Chat", "manual": "✍️ added by you"}[item.source]
     if item.subject:
         origin += f" “{esc(item.subject[:60])}”"
@@ -95,6 +97,8 @@ def item_keyboard(item: Item) -> dict:
     row2 = [button("✖️ Cancel", cb("i", "cancel", item.id))]
     if item.kind == "waiting" and item.thread_id and item.account:
         row2.append(button("✍️ Follow-up", cb("i", "fu", item.id)))
+    if item.space and item.account:
+        row2.append(button("↩️ Reply", cb("i", "crep", item.id)))
     link = item_link(item)
     if link:
         row2.append(url_btn("🔗 Open", link))
@@ -104,6 +108,17 @@ def item_keyboard(item: Item) -> dict:
 def item_card(item: Item, user: User, now: datetime, header: str = "") -> tuple[str, dict]:
     text = item_text(item, user, now)
     return (f"{header}\n\n{text}" if header else text), item_keyboard(item)
+
+
+def chat_preview(item: Item, text: str) -> tuple[str, dict]:
+    who = f" to {esc(item.counterparty)}" if item.counterparty else ""
+    return (
+        f"↩️ *Reply in Google Chat*{who}:\n\n{esc(text)}",
+        keyboard(
+            [button("📤 Send", cb("i", "csend", item.id)), button("✏️ Change", cb("i", "crep", item.id)),
+             button("✖️ Cancel", cb("i", "cx", item.id))],
+        ),
+    )
 
 
 def snooze_keyboard(kind: str, ref: str) -> dict:
@@ -218,3 +233,91 @@ def tasks_message(items: list[Item], user: User, now: datetime, limit: int = 25)
             lines.append(f"{len(refs)}. {PRIORITY_ICON[it.priority]} {esc(it.title)}{who}{due}")
     more = f"\n…and {len(items) - len(refs)} more" if len(items) > len(refs) else ""
     return "📋 *Open items*" + "\n".join(lines) + more + "\n\nTap a number to act on it.", numbered_keyboard(refs)
+
+
+# ---------------------------------------------------------------------- /who
+WHO_SECTIONS = [
+    ("promise", "🫡 You promised"),
+    ("waiting", "⏳ They owe you"),
+    ("reply", "💬 Waiting for your reply"),
+    ("todo", "📌 Related to-dos"),
+]
+
+
+def who_message(query: str, items: list[Item], drafts: list[dict], user: User, now: datetime) -> tuple[str, dict | None]:
+    if not items and not drafts:
+        return f"Nothing open with “{esc(query)}”. /who without a name lists everyone.", None
+    people = {person_key(i.counterparty) for i in items} | {person_key(d.get("to", "")) for d in drafts}
+    show_who = len(people) > 1  # several people matched: name each line
+    lines = [f"👤 *Open with “{esc(query)}”*"]
+    refs: list[tuple[str, str]] = []
+
+    def sort_key(i: Item):
+        return (_aware(i.due_at) or datetime.max.replace(tzinfo=timezone.utc), i.priority != "high")
+
+    for kind, label in WHO_SECTIONS:
+        group = sorted((i for i in items if i.kind == kind), key=sort_key)
+        if not group:
+            continue
+        lines.append(f"\n*{label}*")
+        for it in group:
+            refs.append(("i", it.id))
+            who = f" — {esc(it.counterparty[:40])}" if show_who and it.counterparty else ""
+            due = f" · {due_text(it.due_at, now, user)}" if it.due_at else ""
+            lines.append(f"{len(refs)}. {PRIORITY_ICON[it.priority]} {esc(it.title)}{who}{due}")
+    if drafts:
+        lines.append("\n*📧 Drafts to them*")
+        for d in drafts:
+            refs.append(("d", d["id"]))
+            lines.append(f"{len(refs)}. “{esc(d.get('subject', '')[:60])}” to {esc(d.get('to', ''))}")
+    lines.append("\nTap a number to act on it.")
+    return "\n".join(lines), numbered_keyboard(refs[:25])
+
+
+def people_message(items: list[Item], drafts: list[dict], now: datetime, limit: int = 20) -> str:
+    people: dict[str, dict] = {}
+    for it in items:
+        if not it.counterparty:
+            continue
+        p = people.setdefault(person_key(it.counterparty), {"name": it.counterparty, "open": 0, "overdue": 0})
+        p["open"] += 1
+        due = _aware(it.due_at)
+        if due and due < now:
+            p["overdue"] += 1
+    for d in drafts:
+        p = people.setdefault(person_key(d.get("to", "")), {"name": d.get("to", ""), "open": 0, "overdue": 0})
+        p["open"] += 1
+    if not people:
+        return "No open items with other people. Usage: /who <name or email>"
+    ranked = sorted(people.values(), key=lambda p: (-p["overdue"], -p["open"]))[:limit]
+    lines = ["👥 *People with open items* — /who <name>:\n"]
+    for p in ranked:
+        overdue = f", ⚠️ {p['overdue']} overdue" if p["overdue"] else ""
+        lines.append(f"• {esc(p['name'][:60])} — {p['open']} open{overdue}")
+    return "\n".join(lines)
+
+
+# ------------------------------------------------------------------- /review
+def review_keyboard(item: Item) -> dict:
+    return keyboard(
+        [button("✅ Done", cb("r", "done", item.id)), button("✖️ Cancel", cb("r", "cancel", item.id)),
+         button("🔁 Remind again", cb("r", "again", item.id))],
+        [button("📅 New deadline", cb("r", "due", item.id)), button("⏭ Skip", cb("r", "skip", item.id)),
+         button("⏹ Stop", cb("r", "stop", item.id))],
+    )
+
+
+def review_due_keyboard(ref: str) -> dict:
+    return keyboard(
+        [button("Today 18:00", cb("r", "due", ref, "today")), button("Tomorrow", cb("r", "due", ref, "tm")),
+         button("+3 days", cb("r", "due", ref, "3d"))],
+        [button("Next Monday", cb("r", "due", ref, "mon")), button("« Back", cb("r", "back", ref))],
+    )
+
+
+def review_card(item: Item, user: User, now: datetime, left: int) -> tuple[str, dict]:
+    age = humanize((now - _aware(item.created_at)).total_seconds())
+    reminders = "reminders used up" if item.due_at and item.next_remind_at is None and _aware(item.due_at) < now else ""
+    info = ", ".join(p for p in (f"open for {age}", reminders) if p)
+    text = f"🧹 *Review* — {left} left\n_{info}_\n\n" + item_text(item, user, now) + "\n\nStill relevant?"
+    return text, review_keyboard(item)

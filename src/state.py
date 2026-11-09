@@ -330,6 +330,7 @@ class FirestoreStore:
                     "enabled": True,
                     "needs_reauth": False,
                     "google_sub": account.google_sub or existing.get("google_sub", ""),
+                    "chat_send": account.chat_send,
                 })
                 return LinkResult.UPDATED
             new = account.model_copy(update={"email": email})
@@ -339,6 +340,10 @@ class FirestoreStore:
         return await self._run_in_transaction(txn)
 
     # update/delete take the exact document id (``Account.email`` as loaded)
+    async def users_with_backlog(self) -> set[int]:
+        query = self.db.collection("accounts").where(filter=FieldFilter("backlog", "==", True))
+        return {doc.to_dict().get("user_id") async for doc in query.stream()}
+
     async def update_account(self, email: str, updates: dict) -> None:
         await self.db.collection("accounts").document(email).update(updates)
 

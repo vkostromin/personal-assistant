@@ -6,9 +6,9 @@ from fastapi.testclient import TestClient
 from src import config
 from src.main import app
 from src.models import Account
-from tests.conftest import BASE_URL, make_settings
+from tests.conftest import BASE_URL, BOT_USERNAME, WEBHOOK_HEADERS, make_settings
 
-HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"}
+HEADERS = WEBHOOK_HEADERS
 ADMIN, BOB, EVE = 1001, 2002, 3003
 
 
@@ -33,7 +33,7 @@ def send(client, uid, text, chat_type="private", chat_id=None, username=""):
 
 def invite_code(outbox, chat_id):
     text = outbox.last(chat_id)[1]
-    m = re.search(r"https://t\.me/lola_test_bot\?start=([\w-]+)", text)
+    m = re.search(rf"https://t\.me/{re.escape(BOT_USERNAME)}\?start=([\w-]+)", text)
     assert m, text
     return m.group(1)
 
@@ -178,7 +178,7 @@ def test_invites_list_and_revoke(client, outbox):
 
 def test_command_with_bot_suffix(client, outbox):
     send(client, ADMIN, "/start")
-    send(client, ADMIN, "/help@lola_test_bot")
+    send(client, ADMIN, f"/help@{BOT_USERNAME}")
     assert "/status" in outbox.last(ADMIN)[1]
 
 
