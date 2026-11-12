@@ -22,9 +22,10 @@ setup-telegram:
 	@URL=$$(gcloud run services describe personal-assistant --region=$(REGION) --format='value(status.url)' --project=$(PROJECT_ID)); \
 	curl -s "https://api.telegram.org/bot$(TELEGRAM_BOT_TOKEN)/setWebhook?url=$$URL/webhook&secret_token=$(TELEGRAM_WEBHOOK_SECRET)&drop_pending_updates=true&allowed_updates=%5B%22message%22,%22callback_query%22%5D"
 
-# Optional: let Firestore auto-delete expired "connect Google account" links
+# Optional: let Firestore auto-delete expired "connect Google account" links and webhook dedupe records
 setup-firestore-ttl:
 	gcloud firestore fields ttls update expires_at --collection-group=oauth_states --enable-ttl --project=$(PROJECT_ID)
+	gcloud firestore fields ttls update expires_at --collection-group=telegram_updates --enable-ttl --project=$(PROJECT_ID)
 
 test:
 	python3 -m venv .venv

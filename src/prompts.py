@@ -91,7 +91,7 @@ Messages:
 Respond in this exact JSON format (no markdown, no code fences):
 {{
   "items": [{{"kind": "reply|promise|waiting|todo", "title": "...", "counterparty": "...", "due_at": null,
-             "priority": "high|medium|low"}}],
+             "priority": "high|medium|low", "message_ref": "c3 — the message this is about"}}],
   "updates": [{{"id": "open item id", "status": "done|cancelled|open", "due_at": null, "note": "why"}}],
   "summary_items": ["attention needed items"]
 }}"""
@@ -111,6 +111,15 @@ Respond in this exact JSON format (no markdown, no code fences):
 PARSE_DUE = """Convert this deadline to a date/time. Now: {now}
 Deadline: "{text}"
 Respond in this exact JSON format (no markdown, no code fences): {{"due_at": "ISO 8601 with UTC offset or null"}}"""
+
+CHAT_REPLY = """You are Lola, an AI personal assistant. Write my reply to this Google Chat message.
+
+What it's about: {title}
+From: {counterparty}
+Their message: {message}
+
+Short, natural chat style (1-3 sentences), in the language of their message. If the answer needs
+information only I have, write a brief holding reply. Output only the reply text."""
 
 FOLLOW_UP = """You are Lola, an AI personal assistant. Write a short, polite follow-up email on my behalf.
 

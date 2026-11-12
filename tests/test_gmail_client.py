@@ -5,6 +5,7 @@ import pytest
 
 from src.gmail_client import _build_credentials, GMAIL_SCOPES
 from src.models import Account
+from tests.conftest import CLIENT_ID, CLIENT_SECRET
 
 
 @pytest.fixture
@@ -17,16 +18,16 @@ def account():
 
 
 def test_build_credentials_uses_gmail_scopes(account):
-    client_id = "test-client-id"
-    client_secret = "test-client-secret"
+    client_id = CLIENT_ID
+    client_secret = CLIENT_SECRET
 
     with patch("src.gmail_client.Credentials") as mock_creds:
         _build_credentials(account, client_id, client_secret)
         call_args = mock_creds.from_authorized_user_info.call_args
         info = call_args[0][0]
         assert info["refresh_token"] == "test-refresh-token"
-        assert info["client_id"] == "test-client-id"
-        assert info["client_secret"] == "test-client-secret"
+        assert info["client_id"] == CLIENT_ID
+        assert info["client_secret"] == CLIENT_SECRET
         assert info["token_uri"] == "https://oauth2.googleapis.com/token"
         assert info["scopes"] == GMAIL_SCOPES
         assert "https://www.googleapis.com/auth/gmail.modify" in info["scopes"]
@@ -199,7 +200,8 @@ async def test_analyze_emails_takes_thread_from_real_message(monkeypatch):
     async def fake_completion(cfg, messages, max_tokens=8000):
         assert "Message ID: m42" in messages[-1]["content"]
         return json.dumps({"drafts": [
-            {"to": "a@x.com", "subject": "Re: hi", "body": "b", "original_email_id": "m42", "thread_id": "INVENTED"},
+            {"to": "attacker@evil.com", "subject": "Re: hi", "body": "b", "original_email_id": "m42",
+             "thread_id": "INVENTED"},
             {"to": "b@x.com", "subject": "Re: ?", "body": "b", "original_email_id": "nope"},
         ]}), 10
 
@@ -210,6 +212,22 @@ async def test_analyze_emails_takes_thread_from_real_message(monkeypatch):
     from src.llm_client import AnalysisContext
     ctx = AnalysisContext(now=datetime.now(tz_.utc), tz=tz_.utc, tz_name="UTC")
     result = await analyze_emails(msgs, "me@x.com", LLM(LLMConfig("gemini", "m", "u", "k")), "sig", ctx)
-    d1, d2 = result.drafts
+    [d1] = result.drafts  # the draft not tied to a received email is dropped
     assert (d1.thread_id, d1.original_email_id, d1.in_reply_to) == ("T42", "m42", "<m42@mail>")
-    assert (d2.thread_id, d2.original_email_id, d2.in_reply_to) == (None, None, None)
+    assert d1.to == "a@x.com"  # recipient comes from the email, not from the model
+
+
+async def test_analyze_emails_prefers_reply_to(monkeypatch):
+    import json
+    from datetime import timezone as tz_
+    from src.llm_client import LLM, AnalysisContext, LLMConfig, analyze_emails
+
+    async def fake_completion(cfg, messages, max_tokens=8000):
+        return json.dumps({"drafts": [{"to": "x@x.com", "subject": "Re: hi", "body": "b", "original_email_id": "m1"}]}), 10
+
+    monkeypatch.setattr("src.llm_client.chat_completion", fake_completion)
+    msgs = [{"id": "m1", "thread_id": "T1", "from": "noreply@x.com", "reply_to": "Ann <ann@x.com>", "subject": "hi",
+             "date": "", "body": "?"}]
+    ctx = AnalysisContext(now=datetime.now(tz_.utc), tz=tz_.utc, tz_name="UTC")
+    [d] = (await analyze_emails(msgs, "me@x.com", LLM(LLMConfig("gemini", "m", "u", "k")), "sig", ctx)).drafts
+    assert d.to == "Ann <ann@x.com>"

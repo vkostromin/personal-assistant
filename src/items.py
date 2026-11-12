@@ -14,6 +14,7 @@ Reminder policy (all times in the user's timezone, never during QUIET_HOURS):
 
 import hashlib
 import re
+import unicodedata
 from dataclasses import dataclass
 from datetime import datetime, time, timedelta, timezone, tzinfo
 
@@ -236,3 +237,45 @@ def rank_focus(items: list[Item], drafts: list[dict], now: datetime, limit: int 
             entries.append(FocusEntry("draft", d, score))
     entries.sort(key=lambda e: e.score, reverse=True)
     return entries[:limit]
+
+
+# ------------------------------------------------------------------ people
+def normalize_text(text: str) -> str:
+    """Casefold and strip accents ("Zoë" → "zoe")."""
+    decomposed = unicodedata.normalize("NFKD", text or "")
+    return "".join(c for c in decomposed if not unicodedata.combining(c)).casefold()
+
+
+def matches_person(query: str, text: str) -> bool:
+    """All words of the query appear in the name/email ("alex smith", "alex@", "acme.com")."""
+    haystack = normalize_text(text)
+    words = normalize_text(query).split()
+    return bool(words) and all(w in haystack for w in words)
+
+
+def person_key(counterparty: str) -> str:
+    """Group "Alex <alex@x.com>" and "alex@x.com" together: email if present, else the name."""
+    m = re.search(r"[\w.+-]+@[\w-]+\.[\w.-]+", counterparty or "")
+    return m.group(0).lower() if m else normalize_text(counterparty).strip()
+
+
+# ------------------------------------------------------------------ review
+def is_stale(item: Item, now: datetime, after_days: int | None = None) -> bool:
+    """Needs a decision: old, or overdue with all reminders used up — and not reviewed recently."""
+    if item.status != "open":
+        return False
+    days = config.settings.review_after_days if after_days is None else after_days
+    snoozed = _aware(item.snoozed_until)
+    if snoozed and snoozed > now:
+        return False
+    reviewed = _aware(item.reviewed_at)
+    if reviewed and now - reviewed < timedelta(days=days):
+        return False
+    old = now - _aware(item.created_at) > timedelta(days=days)
+    due = _aware(item.due_at)
+    given_up = due is not None and due < now and item.next_remind_at is None
+    return old or given_up
+
+
+def review_queue(items: list[Item], now: datetime) -> list[Item]:
+    return sorted((i for i in items if is_stale(i, now)), key=lambda i: (_aware(i.created_at), i.id))

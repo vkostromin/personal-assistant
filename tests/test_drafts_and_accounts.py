@@ -6,9 +6,11 @@ from src.main import app
 from src.models import Account, User
 from src.schedule import current_slot, tz_of
 from src.models import utcnow
+from tests.conftest import WEBHOOK_HEADERS
 
-HEADERS = {"X-Telegram-Bot-Api-Secret-Token": "test-webhook-secret"}
+HEADERS = WEBHOOK_HEADERS
 ADMIN, BOB, CAROL = 1001, 2002, 3003
+
 
 
 @pytest.fixture
@@ -51,7 +53,7 @@ async def test_drafts_command_syncs_with_gmail(client, outbox, store, users, gma
 
 
 async def test_run_syncs_drafts_and_reports(store, outbox, users, gmail_drafts, monkeypatch):
-    monkeypatch.setattr(runner, "fetch_recent_messages", lambda **kw: [])
+    monkeypatch.setattr(runner, "list_message_ids", lambda **kw: ([], False))  # empty mailbox
     monkeypatch.setattr(runner, "list_spaces", lambda **kw: [])
     await add_drafts(store, 2)
     gmail_drafts.gone = {"g2": "sent"}

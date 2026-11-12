@@ -47,50 +47,69 @@ def _extract_body(payload: dict) -> str:
     return ""
 
 
-def fetch_recent_messages(
+def list_message_ids(
     account: Account,
     client_id: str,
     client_secret: str,
-    last_run: datetime | None,
-    max_results: int = 20,
+    since: datetime,
     sent: bool = False,
-) -> list[dict]:
-    """Recent received mail, or (``sent=True``) mail I sent — used to find my promises
-    and the questions I'm waiting an answer for."""
+    cap: int | None = None,
+) -> tuple[list[str], bool]:
+    """IDs of messages received (or, with ``sent``, sent) after ``since``, newest first.
+
+    At most ``cap`` ids (None = no limit). Returns ``(ids, truncated)``. The query starts a
+    second early — exact filtering happens on ``internalDate`` after fetching.
+    """
     service = _get_service(account, client_id, client_secret)
     base = "in:sent" if sent else "-in:sent -in:drafts"
-    query = f"after:{int(last_run.timestamp())} {base}" if last_run else base
+    query = f"after:{int(since.timestamp()) - 1} {base}"
+    ids: list[str] = []
+    page_token = None
+    while True:
+        try:
+            resp = (
+                service.users().messages()
+                .list(userId="me", q=query, maxResults=500, pageToken=page_token)
+                .execute()
+            )
+        except HttpError as e:
+            log.error("Gmail list failed for %s: %s", account.email, e)
+            break
+        ids.extend(m["id"] for m in resp.get("messages", []))
+        if cap is not None and len(ids) > cap:
+            return ids[:cap], True
+        page_token = resp.get("nextPageToken")
+        if not page_token:
+            break
+    return ids, False
 
-    try:
-        results = service.users().messages().list(userId="me", q=query, maxResults=max_results).execute()
-    except HttpError:
-        return []
 
+def get_messages(account: Account, client_id: str, client_secret: str, ids: list[str]) -> list[dict]:
+    """Full messages for ``ids``, oldest first. ``internal_ms`` = when Gmail received/sent it."""
+    service = _get_service(account, client_id, client_secret)
     messages = []
-    for msg in results.get("messages", []):
-        full = (
-            service.users()
-            .messages()
-            .get(userId="me", id=msg["id"], format="full")
-            .execute()
-        )
+    for msg_id in ids:
+        try:
+            full = service.users().messages().get(userId="me", id=msg_id, format="full").execute()
+        except HttpError as e:
+            log.warning("Gmail get %s failed: %s", msg_id, e)
+            continue
         headers = {h["name"].lower(): h["value"] for h in full["payload"].get("headers", [])}
-        body = _extract_body(full["payload"])
-
         messages.append(
             {
-                "id": msg["id"],
+                "id": msg_id,
                 "thread_id": full.get("threadId", ""),
+                "internal_ms": int(full.get("internalDate", 0)),
                 "from": headers.get("from", ""),
+                "reply_to": headers.get("reply-to", ""),
                 "to": headers.get("to", ""),
                 "subject": headers.get("subject", ""),
                 "date": headers.get("date", ""),
                 "message_id_header": headers.get("message-id", ""),
-                "body": body[:2000],
+                "body": _extract_body(full["payload"])[:2000],
             }
         )
-
-    return messages
+    return sorted(messages, key=lambda m: m["internal_ms"])
 
 
 def _draft_resource(to: str, subject: str, body: str, thread_id: str | None, in_reply_to: str | None = None) -> dict:

@@ -5,17 +5,15 @@ import asyncio
 import logging
 import time
 from dataclasses import dataclass, field
-from datetime import datetime, timedelta
-
-from google.auth.exceptions import RefreshError
+from datetime import datetime, timedelta, timezone
 
 from src import config
-from src.actions import add_item, apply_update
+from src.actions import add_item, apply_update, is_revoked, signature_for
 from src.cards import entry_line, focus_message
 from src.chat_client import fetch_messages, list_spaces, space_link
 from src.drafts_sync import sync_note, sync_user_drafts
-from src.gmail_client import create_draft, fetch_recent_messages, thread_link
-from src.items import rank_focus
+from src.gmail_client import create_draft, get_messages, list_message_ids, thread_link
+from src.items import rank_focus, review_queue
 from src.llm_client import LLM, AnalysisContext, Analysis, LLMError, analyze_chat, analyze_emails, analyze_sent, compose_summary
 from src.models import Account, User, utcnow
 from src.quota import LLMUnavailable, QuotaExceeded, get_llm, start_window
@@ -37,16 +35,9 @@ class UserRunResult:
     failed: list[str] = field(default_factory=list)
     quota_hit: bool = False
     deferred: list[str] = field(default_factory=list)
+    truncated: dict[str, int] = field(default_factory=dict)  # account -> cap that was hit
+    backlog: list[str] = field(default_factory=list)
     llm_error: str = ""
-
-
-def _is_revoked(exc: BaseException) -> bool:
-    """Token can't be used any more and the user must sign in again.
-
-    invalid_grant: revoked / expired (e.g. 7-day limit for apps in Testing status)
-    unauthorized_client: token was issued to a different OAuth client (old Desktop client)
-    """
-    return isinstance(exc, RefreshError) and any(code in str(exc) for code in ("invalid_grant", "unauthorized_client"))
 
 
 async def run_all_users(now: datetime | None = None, force: bool = False) -> dict:
@@ -62,29 +53,36 @@ async def run_all_users(now: datetime | None = None, force: bool = False) -> dic
     stats = {"users": 0, "skipped": 0, "errors": 0, "deferred": 0, "not_due": 0}
     deadline = time.monotonic() + config.settings.run_soft_deadline_seconds
 
-    due: list[tuple[User, datetime]] = []
+    backlog_users = await store.users_with_backlog()
+    due: list[tuple[User, datetime | None]] = []
     for user in await store.list_users():
         if not user.is_active:
             continue
         slot = current_slot(now, user_tz(user)) if force else due_slot(user, now)
-        if slot is None:
-            stats["not_due"] += 1
-        else:
+        if slot is not None:
             due.append((user, slot))
+        elif user.id in backlog_users:
+            due.append((user, None))  # continue unfinished mail processing quietly
+        else:
+            stats["not_due"] += 1
+    stats["backlog"] = 0
 
-    async def one(user: User, slot: datetime):
+    async def one(user: User, slot: datetime | None):
         async with sem:
             if time.monotonic() > deadline:
                 # slot not claimed, watermarks untouched: caught up at the next hourly run
                 stats["deferred"] += 1
                 log.warning("Run deadline reached — user %s deferred to next run", user.id)
                 return
-            if not await store.claim_run_slot(user.id, slot) and not force:
+            if slot is not None and not await store.claim_run_slot(user.id, slot) and not force:
                 stats["not_due"] += 1  # processed concurrently by another /run
                 return
             try:
-                processed = await run_for_user(user, deadline, now=now)
-                stats["users" if processed else "skipped"] += 1
+                processed = await run_for_user(user, deadline, now=now, silent=slot is None)
+                if slot is None:
+                    stats["backlog"] += 1
+                else:
+                    stats["users" if processed else "skipped"] += 1
             except Exception as exc:  # noqa: BLE001 — slot stays claimed: no hourly retry loop
                 stats["errors"] += 1
                 log.error("Run failed for user %s: %s", user.id, exc, exc_info=True)
@@ -94,17 +92,24 @@ async def run_all_users(now: datetime | None = None, force: bool = False) -> dic
     return stats
 
 
-async def run_for_user(user: User, deadline: float | None = None, now: datetime | None = None) -> bool:
-    """Process all accounts of ``user`` and send them a digest. Returns False if nothing to do."""
+async def run_for_user(
+    user: User, deadline: float | None = None, now: datetime | None = None, silent: bool = False
+) -> bool:
+    """Process all accounts of ``user`` and send them a digest. Returns False if nothing to do.
+
+    ``silent``: only continue accounts with a backlog (no summary, same usage window)."""
     s = config.settings
     store = get_store()
     accounts = await store.list_accounts(user_id=user.id)
+    if silent:
+        accounts = [a for a in accounts if a.backlog]
     if not accounts:
         return False
 
     now = now or utcnow()
-    draft_sync = await sync_user_drafts(user.id)  # drafts sent/deleted in Gmail since last time
-    await start_window(user.id)  # every scheduled run starts a fresh 12h limit
+    draft_sync = {} if silent else await sync_user_drafts(user.id)  # drafts sent/deleted in Gmail
+    if not silent:
+        await start_window(user.id)  # every scheduled run starts a fresh 12h limit
     try:
         llm = await get_llm(user)
     except LLMUnavailable:
@@ -119,8 +124,14 @@ async def run_for_user(user: User, deadline: float | None = None, now: datetime 
         if deadline is not None and time.monotonic() > deadline:
             log.warning("Run deadline reached — account %s deferred to next run", account.email)
             result.deferred.append(account.email)
+            # picked up quietly by the next hourly run instead of waiting for the next summary slot
+            await store.update_account(account.email, {"backlog": True})
             continue
-        await _process_account(user, account, result, llm, now)
+        await _process_account(user, account, result, llm, now, deadline)
+
+    if silent:
+        log.info("Backlog for user %s: %d drafts, %d new items", user.id, result.drafts_created, result.new_items)
+        return True
 
     # What matters now: ranked open items + drafts ready to send
     open_items = await store.list_open_items(user.id)
@@ -145,7 +156,7 @@ async def run_for_user(user: User, deadline: float | None = None, now: datetime 
                 promises=promises_text,
                 date=date,
                 llm=llm,
-                signature=s.signature,
+                signature=signature_for(user),
                 focus=focus_text,
             )
         except LLMError as exc:
@@ -156,6 +167,9 @@ async def run_for_user(user: User, deadline: float | None = None, now: datetime 
             )
 
     notes = []
+    stale = len(review_queue(open_items, now))
+    if stale >= 5:
+        notes.append(f"🧹 {stale} items are getting old — /review them in a minute.")
     if result.new_items or result.closed_items:
         parts = [f"{result.new_items} new"] if result.new_items else []
         parts += [f"{result.closed_items} resolved"] if result.closed_items else []
@@ -174,8 +188,15 @@ async def run_for_user(user: User, deadline: float | None = None, now: datetime 
         )
     for email in result.reauth_needed:
         notes.append(f"🔑 Access to {escape_markdown(email)} expired or was revoked — send /connect to reconnect it.")
+    for email, limit in result.truncated.items():
+        notes.append(
+            f"📬 {escape_markdown(email)} had more than {limit} new emails — only the newest {limit} were analyzed. "
+            "With your own AI key (/setkey) there's no limit."
+        )
+    for email in result.backlog:
+        notes.append(f"⏳ Still working through {escape_markdown(email)} — the rest is processed in the next hour(s).")
     for email in result.deferred:
-        notes.append(f"⏱ {escape_markdown(email)} will be checked at the next run (this run ran out of time).")
+        notes.append(f"⏱ {escape_markdown(email)} wasn't checked yet (this run ran out of time) — it's done within the hour.")
     for email in result.failed:
         notes.append(f"⚠️ Could not check {escape_markdown(email)} this time; will retry next run.")
     text = "\n\n".join(part for part in [summary, "\n".join(notes)] if part)
@@ -195,9 +216,11 @@ async def _context(user: User, now: datetime) -> AnalysisContext:
 
 
 async def _apply(user: User, analysis: Analysis, result: UserRunResult, *, source: str, account: Account,
-                 messages: list[dict] | None = None, space: dict | None = None) -> None:
+                 messages: list[dict] | None = None, space: dict | None = None,
+                 chat_messages: list[dict] | None = None) -> None:
     """Store extracted items (deduplicated) and apply updates to open items."""
     by_id = {m["id"]: m for m in messages or []}
+    by_ref = {f"c{n}": m for n, m in enumerate(chat_messages or [], 1)}
     for update in analysis.updates:
         await apply_update(user, update)
         if update.status:
@@ -205,11 +228,32 @@ async def _apply(user: User, analysis: Analysis, result: UserRunResult, *, sourc
     for extracted in analysis.items:
         message = by_id.get(extracted.original_email_id or "")
         link = thread_link(account.email, message.get("thread_id")) if message else (space_link(space) if space else "")
-        if await add_item(user, extracted, source=source, account=account.email, message=message, space=space, link=link):
+        chat_message = by_ref.get(extracted.message_ref or "")
+        if await add_item(user, extracted, source=source, account=account.email, message=message, space=space,
+                          link=link, chat_message=chat_message):
             result.new_items += 1
 
 
-async def _process_account(user: User, account: Account, result: UserRunResult, llm: LLM, now: datetime) -> None:
+async def _save_drafts(user: User, account: Account, analysis: Analysis, result: UserRunResult) -> None:
+    s = config.settings
+    store = get_store()
+    for draft in analysis.drafts:
+        draft_id = await store.save_draft(user.id, draft.model_dump())
+        gmail_draft_id = await asyncio.to_thread(
+            create_draft, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret,
+            to=draft.to, subject=draft.subject, body=draft.body, thread_id=draft.thread_id,
+            in_reply_to=draft.in_reply_to,
+        )
+        if gmail_draft_id:
+            await store.update_draft(draft_id, {"gmail_draft_id": gmail_draft_id})
+            result.drafts_created += 1
+        else:
+            log.error("Failed to create Gmail draft for %s", account.email)
+
+
+async def _process_account(
+    user: User, account: Account, result: UserRunResult, llm: LLM, now: datetime, deadline: float | None = None
+) -> None:
     s = config.settings
     store = get_store()
     started = utcnow()
@@ -222,6 +266,7 @@ async def _process_account(user: User, account: Account, result: UserRunResult, 
         return (account.last_run if not account.provider_last_run else None) or lookback
 
     succeeded: list[str] = []
+    completed: list[str] = []
     failed = False
     quota_hit = False
     log.info("Processing account %s (user %s)", account.email, user.id)
@@ -232,53 +277,77 @@ async def _process_account(user: User, account: Account, result: UserRunResult, 
         if quota_hit:
             return True
         try:
-            if await work() is not False:
+            handled = await work() is False  # mail providers advance their own watermark per batch
+            if not handled:
                 succeeded.append(provider)
+            completed.append(provider)
         except QuotaExceeded:
             # watermark not advanced: analyzed at the next run with a fresh limit
             quota_hit = result.quota_hit = True
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, LLMError):
                 result.llm_error = result.llm_error or str(exc)
-            if _is_revoked(exc):
+            if is_revoked(exc):
                 await _mark_reauth(account, result)
                 return False
             failed = True
             log.error("%s processing failed for %s: %s", provider, account.email, exc, exc_info=True)
         return True
 
-    async def inbox():
-        messages = await asyncio.to_thread(
-            fetch_recent_messages, account=account, client_id=s.google_client_id,
-            client_secret=s.google_client_secret, last_run=since("gmail"),
-        )
-        if not messages:
-            return
-        analysis = await analyze_emails(messages, account.email, llm, s.signature, await _context(user, now))
-        for draft in analysis.drafts:
-            draft_id = await store.save_draft(user.id, draft.model_dump())
-            gmail_draft_id = await asyncio.to_thread(
-                create_draft, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret,
-                to=draft.to, subject=draft.subject, body=draft.body, thread_id=draft.thread_id,
-                in_reply_to=draft.in_reply_to,
-            )
-            if gmail_draft_id:
-                await store.update_draft(draft_id, {"gmail_draft_id": gmail_draft_id})
-                result.drafts_created += 1
-            else:
-                log.error("Failed to create Gmail draft for %s", account.email)
-        await _apply(user, analysis, result, source="email", account=account, messages=messages)
-        result.email_items.extend(analysis.summary_items)
+    first_run = not account.provider_last_run and not account.last_run
+    cap = None if llm.config.own_key else (s.max_messages_first_run if first_run else s.max_messages_per_run)
 
-    async def sent():
-        messages = await asyncio.to_thread(
-            fetch_recent_messages, account=account, client_id=s.google_client_id,
-            client_secret=s.google_client_secret, last_run=since("gmail_sent"), sent=True,
+    def out_of_time() -> bool:
+        return deadline is not None and time.monotonic() > deadline
+
+    async def mail(provider: str, sent: bool) -> bool:
+        """Oldest-first batches; the watermark advances after every batch, so an interruption
+        (deadline, AI limit, error) never loses or re-processes mail. False = watermark handled."""
+        watermark = since(provider)
+        seen = set(account.provider_seen_ids.get(provider, []))
+        ids, truncated = await asyncio.to_thread(
+            list_message_ids, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret,
+            since=watermark, sent=sent, cap=None if cap is None else cap + len(seen),
         )
-        if not messages:
-            return
-        analysis = await analyze_sent(messages, account.email, llm, await _context(user, now))
-        await _apply(user, analysis, result, source="sent", account=account, messages=messages)
+        ids = [i for i in ids if i not in seen]
+        if cap is not None and len(ids) > cap:
+            ids, truncated = ids[:cap], True
+        if truncated:
+            # keep the newest `cap`; older ones are skipped (that's the limit)
+            result.truncated[account.email] = cap
+        ids.reverse()  # oldest first
+        min_ms = int(watermark.timestamp() * 1000)
+        boundary_ms = min_ms
+        for start in range(0, len(ids), s.email_batch_size):
+            if out_of_time():
+                result.backlog.append(account.email)
+                return False
+            batch = [
+                m for m in await asyncio.to_thread(
+                    get_messages, account=account, client_id=s.google_client_id,
+                    client_secret=s.google_client_secret, ids=ids[start:start + s.email_batch_size],
+                )
+                if m["internal_ms"] >= min_ms and m["id"] not in seen
+            ]
+            if not batch:
+                continue
+            if sent:
+                analysis = await analyze_sent(batch, account.email, llm, await _context(user, now))
+            else:
+                analysis = await analyze_emails(batch, account.email, llm, signature_for(user), await _context(user, now))
+                await _save_drafts(user, account, analysis, result)
+                result.email_items.extend(analysis.summary_items)
+            await _apply(user, analysis, result, source="sent" if sent else "email", account=account, messages=batch)
+            last_ms = batch[-1]["internal_ms"]
+            at_last = {m["id"] for m in batch if m["internal_ms"] == last_ms}
+            # several emails can share one internalDate across batches: accumulate, don't overwrite
+            seen = (seen | at_last) if last_ms == boundary_ms else at_last
+            boundary_ms = last_ms
+            await store.update_account(account.email, {
+                f"provider_last_run.{provider}": datetime.fromtimestamp(last_ms / 1000, tz=timezone.utc),
+                f"provider_seen_ids.{provider}": sorted(seen),
+            })
+        return False
 
     async def chat():
         spaces = await asyncio.to_thread(
@@ -292,13 +361,13 @@ async def _process_account(user: User, account: Account, result: UserRunResult, 
             if not messages:
                 continue
             analysis = await analyze_chat(messages, space.get("displayName", space["name"]), llm, await _context(user, now))
-            await _apply(user, analysis, result, source="chat", account=account, space=space)
+            await _apply(user, analysis, result, source="chat", account=account, space=space, chat_messages=messages)
             result.chat_items.extend(analysis.summary_items)
 
     if "gmail" in account.providers:
-        if not await step("gmail", inbox):
+        if not await step("gmail", lambda: mail("gmail", sent=False)):
             return
-        if not await step("gmail_sent", sent):
+        if not await step("gmail_sent", lambda: mail("gmail_sent", sent=True)):
             return
     if "chat" in account.providers:
         if not await step("chat", chat):
@@ -306,10 +375,11 @@ async def _process_account(user: User, account: Account, result: UserRunResult, 
 
     # Advance the watermark only for providers that completed, so a failure is retried
     # next run without re-processing (and re-drafting) the providers that succeeded.
-    if succeeded:
-        updates: dict = {f"provider_last_run.{p}": started for p in succeeded}
+    updates: dict = {f"provider_last_run.{p}": started for p in succeeded}
+    if completed:
         updates["last_run"] = started
-        await store.update_account(account.email, updates)
+    updates["backlog"] = account.email in result.backlog
+    await store.update_account(account.email, updates)
     if failed:
         result.failed.append(account.email)
 

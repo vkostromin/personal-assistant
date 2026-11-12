@@ -15,6 +15,7 @@ from src.prompts import (
     ANALYZE_EMAILS,
     ANALYZE_SENT,
     ANSWER_QUESTION,
+    CHAT_REPLY,
     COMPOSE_SUMMARY,
     CONTEXT,
     FOLLOW_UP,
@@ -131,6 +132,7 @@ class ExtractedItem:
     due_at: datetime | None = None
     priority: str = "medium"
     original_email_id: str | None = None
+    message_ref: str | None = None  # Chat: "c3" = the message this item is about
 
 
 @dataclass
@@ -172,6 +174,7 @@ def _parse_items(raw, ctx: AnalysisContext, allowed_kinds: set[str] = _KINDS) ->
                 due_at=parse_due(d.get("due_at"), ctx.tz),
                 priority=priority if priority in _PRIORITIES else "medium",
                 original_email_id=str(d["original_email_id"]) if d.get("original_email_id") else None,
+                message_ref=str(d["message_ref"]) if d.get("message_ref") else None,
             )
         )
     return result
@@ -228,24 +231,31 @@ async def analyze_emails(
         return Analysis(summary_items=["Failed to analyze emails"])
 
     now = datetime.now()
-    # Thread/Message-ID come from the real email (never trust IDs invented by the model):
+    # Recipient, thread and Message-ID come from the real email, never from the model:
+    # an email can contain instructions ("reply to attacker@evil.com") that steer the LLM,
     # a made-up threadId makes Gmail reject the draft, and the ids are needed for threading
-    # and for detecting later that the reply was sent.
+    # and for detecting later that the reply was sent. Drafts not tied to a real email are dropped.
     by_id = {m["id"]: m for m in messages}
     by_thread = {m.get("thread_id"): m for m in messages if m.get("thread_id")}
     drafts = []
     for d in data.get("drafts", []) if isinstance(data.get("drafts"), list) else []:
+        if not isinstance(d, dict):
+            continue
         original = by_id.get(str(d.get("original_email_id") or "")) or by_thread.get(str(d.get("thread_id") or ""))
+        to = (original.get("reply_to") or original.get("from") or "") if original else ""
+        if not to:
+            log.warning("analyze_emails: dropping draft not tied to a received email (%s)", str(d.get("subject"))[:80])
+            continue
         priority = str(d.get("priority", "medium")).lower()
         drafts.append(
             Draft(
                 account=account,
-                to=d.get("to", ""),
-                subject=d.get("subject", ""),
-                body=d.get("body", ""),
-                thread_id=original.get("thread_id") or None if original else None,
-                original_email_id=original["id"] if original else None,
-                in_reply_to=original.get("message_id_header") or None if original else None,
+                to=to,
+                subject=str(d.get("subject") or f"Re: {original.get('subject', '')}"),
+                body=str(d.get("body") or ""),
+                thread_id=original.get("thread_id") or None,
+                original_email_id=original["id"],
+                in_reply_to=original.get("message_id_header") or None,
                 priority=priority if priority in _PRIORITIES else "medium",
                 created_at=now,
             )
@@ -270,7 +280,8 @@ async def analyze_sent(messages: list[dict], account: str, llm: LLM, ctx: Analys
 
 
 async def analyze_chat(messages: list[dict], space_name: str, llm: LLM, ctx: AnalysisContext) -> Analysis:
-    formatted = "\n".join(f"[{m['time'][:16]}] {m['sender']}: {m['text']}" for m in messages)
+    # short refs (c1, c2…) instead of long Chat resource names, mapped back by the caller
+    formatted = "\n".join(f"[c{n} {m['time'][:16]}] {m['sender']}: {m['text']}" for n, m in enumerate(messages, 1))
     prompt = ANALYZE_CHAT.format(space_name=space_name, messages=formatted, context=ctx.render(), item_rules=ITEM_RULES)
     data = await _json_call(llm, prompt, "analyze_chat")
     if data is None:
@@ -294,6 +305,12 @@ async def parse_task(text: str, llm: LLM, ctx: AnalysisContext) -> ExtractedItem
 async def parse_due_text(text: str, llm: LLM, ctx: AnalysisContext) -> datetime | None:
     data = await _json_call(llm, PARSE_DUE.format(text=text[:200], now=ctx.now_text()), "parse_due")
     return parse_due(data.get("due_at"), ctx.tz) if data else None
+
+
+async def suggest_chat_reply(item: Item, llm: LLM) -> str:
+    prompt = CHAT_REPLY.format(title=item.title, counterparty=item.counterparty or "-", message=item.detail or "-")
+    content = await llm.complete([{"role": "user", "content": prompt}])
+    return content.strip().strip('"')
 
 
 async def write_follow_up(item: Item, due_text: str, llm: LLM, signature: str) -> dict | None:

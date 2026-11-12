@@ -69,7 +69,7 @@ def test_default_timezone_setting(monkeypatch):
 # ---------------------------------------------------------------- runner
 @pytest.fixture
 def quiet_google(monkeypatch):
-    monkeypatch.setattr(runner, "fetch_recent_messages", lambda **kw: [])  # also sent=True
+    monkeypatch.setattr(runner, "list_message_ids", lambda **kw: ([], False))  # empty mailbox
     monkeypatch.setattr(runner, "list_spaces", lambda **kw: [])
 
 

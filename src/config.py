@@ -52,11 +52,19 @@ class Settings(BaseSettings):
     waiting_default_hours: int = 48
     # Max reminder cards per user per hourly run (the rest follow next hour)
     max_reminders_per_run: int = 5
+    # /review: open items older than this (or overdue with reminders used up)
+    review_after_days: int = 7
 
     invite_ttl_hours: int = 72
     oauth_link_ttl_minutes: int = 15
-    # How far back to look for a newly linked account's first run
-    initial_lookback_hours: int = 12
+    # First run of a newly linked account: look back this far, at most MAX_MESSAGES_FIRST_RUN emails
+    initial_lookback_hours: int = 168
+    max_messages_first_run: int = 200
+    # Later runs: everything since the previous run (≈12h), at most this many emails per mailbox
+    # (received and sent are counted separately). Users with their own AI key have no count limit.
+    max_messages_per_run: int = 100
+    # Emails per LLM call; the watermark advances after every batch
+    email_batch_size: int = 20
     # How many users are processed in parallel during a scheduled run
     run_concurrency: int = 5
     # Stop *starting* users/accounts after this many seconds, so /run finishes inside the

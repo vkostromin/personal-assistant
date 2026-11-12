@@ -18,11 +18,14 @@ Cloud Run Service (FastAPI) ─── POST /run
        └── for every active user whose local 08:00 / 20:00 slot is due (5 in parallel):
              sync drafts with Gmail (sent / deleted there → status updated)
              for each of the user's Google accounts (open items given to the LLM as context):
-               ├── Gmail inbox → up to 20 emails since watermark → LLM → drafts + items + updates
-               ├── Gmail sent  → my emails since watermark → LLM → my promises + waiting-for + updates
+               ├── Gmail inbox → emails since watermark (≤100; first run: 1 week, ≤200; own key: no cap),
+               │                 oldest first, batches of 20 → LLM → drafts + items + updates;
+               │                 watermark (internalDate + ids at that ms) saved after every batch
+               ├── Gmail sent  → same, separate watermark → my promises + waiting-for + updates
                └── Chat        → messages (mine marked "Me") → LLM → items + updates
              └── summary (LLM, led by the ranked Focus list) + Focus message with buttons
        └── reminders: items/drafts with next_remind_at <= now (not in quiet hours) → cards with buttons
+       └── accounts with `backlog=true` (run stopped early) → continued quietly every hour, no summary
              └── Telegram Bot API → that user's own digest to that user's chat
 
 Interactive (any time):
@@ -51,7 +54,7 @@ Cloud Run URL: see SERVICE_URL in .env
 | Notifications | Telegram bot (token in `.env`) |
 | Gmail integration | Direct API — fetch max 20 emails, body truncated at 2000 chars, create drafts, never auto-send |
 | Chat integration | Google Chat API — read-only |
-| Email signature | Configurable via `SIGNATURE` (default "Lola, Your AI Assistant") |
+| Email signature | Per user via `/signature`; server default `SIGNATURE` ("Lola, Your AI Assistant") |
 | Users | `users/{telegram_user_id}`; first `/start` on a fresh deployment = admin, others need a single-use invite |
 | Identity | Telegram `from.id`; private chats only |
 | Accounts | `accounts/{email}` owned by exactly one user (`user_id`); a user can link several |
@@ -96,6 +99,8 @@ Cloud Run URL: see SERVICE_URL in .env
 | `/remove <id>` | admin | Delete user + accounts (tokens revoked) + drafts + promises |
 | `/setlimit <id> <tokens\|default\|unlimited>` | admin | Per-user token limit override |
 | `/transferadmin <id>` | admin | Hand the admin role to another user |
+| `/who [name]` | user | Everything open with a person (or list of people) |
+| `/review` | user | Decide on old / forgotten items one by one |
 
 ## Data Flow: Scheduled Run
 
@@ -129,7 +134,9 @@ snoozed_until, next_remind_at, remind_stage, last_reminded_at, fingerprint, reso
   + age (≤10); drafts +20; waiting only when overdue; snoozed excluded.
 
 ## Buttons (callback data `<d|i|t>:<action>:<id>[:<arg>]`)
-- item: done, cancel, snz[:2|4|8|tm], due[:today|tm|3d|mon|none|other], fu (follow-up draft), open, back
+- item: done, cancel, snz[:2|4|8|tm], due[:today|tm|3d|mon|none|other], fu (follow-up draft), open, back,
+  crep (Chat reply: next text = reply) → preview → csend (post as the user in the thread) / cx; csug (LLM drafts it)
+- review (`r`): done, cancel, again (restart reminders), due[:choice], skip, stop, back — then next old item
 - draft: send → sendok (confirmation), rw (rewrite; next text = instructions), snz, del, sent, open, back
 - text: add (LLM → task), ask (answer question) for the last plain text the user sent
 - Every press checks that the record belongs to the presser; pending free-text actions expire after 15 min.

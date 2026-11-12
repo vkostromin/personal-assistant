@@ -34,7 +34,7 @@ Create a Firestore database (Native mode) and an Artifact Registry repo `assista
 ### 3. Configure the OAuth consent screen
 GCP Console → APIs & Services → OAuth consent screen (Google Auth Platform):
 - Add scopes: `openid`, `.../auth/userinfo.email`, `.../auth/gmail.modify`,
-  `.../auth/chat.spaces.readonly`, `.../auth/chat.messages.readonly`.
+  `.../auth/chat.spaces.readonly`, `.../auth/chat.messages.readonly`, `.../auth/chat.messages.create`.
 - **Audience** — pick what fits your users (see [Google account limits](#google-account-limits)):
   - *Internal*: all users are in your Google Workspace organisation. No verification, no expiry.
   - *External + Testing*: add every user's Gmail address under **Test users** (max 100).
@@ -65,7 +65,7 @@ gcloud scheduler jobs create http lola-run --location=us-central1 \
   --schedule="0 * * * *" --time-zone="Etc/UTC" \
   --uri="$(gcloud run services describe personal-assistant --region=us-central1 --format='value(status.url)')/run" \
   --http-method=POST --headers=X-Run-Secret=$RUN_SECRET --attempt-deadline=300s
-make setup-firestore-ttl   # optional: auto-clean expired sign-in links
+make setup-firestore-ttl   # optional: auto-clean expired sign-in links and webhook dedupe records
 ```
 
 ### 7. Become the admin
@@ -89,10 +89,11 @@ will be linked to, to protect people from "please click this link" phishing.
 | Everyone | Admin only |
 |----------|------------|
 | `/focus`, `/tasks [kind]`, `/task <text>`, plain/forwarded text → task | |
+| `/who [name]` — everything open with a person; `/review` — decide on old items | |
 | `/status`, `/chat <question>`, `/raw <text>` | `/invite [note]`, `/invites`, `/revoke <code>` |
 | Drafts: `/drafts`, `/draft N`, `/rewrite N <context>`, `/sent N…`, `/deletedraft N…` | `/users`, `/disable <id>`, `/enable <id>` |
 | Google: `/connect`, `/accounts`, `/unlink [email] <gmail\|chat>`, `/disconnect <email>` | `/remove <id>` — deletes the user, their accounts (tokens revoked), drafts and promises |
-| Settings: `/timezone [zone]`, `/llm`, `/setkey <provider> <key> [model]`, `/removekey` | `/setlimit <id> <tokens\|default\|unlimited>` — e.g. `/setlimit 12345 300k` |
+| Settings: `/timezone [zone]`, `/signature [text\|reset]`, `/llm`, `/setkey <provider> <key> [model]`, `/removekey` | `/setlimit <id> <tokens\|default\|unlimited>` — e.g. `/setlimit 12345 300k` |
 | `/deleteme` — delete own account and all data (confirm with `/deleteme YES`), `/help` | `/transferadmin <id>` — hand the admin role to another user |
 
 ### Focus, promises and reminders
@@ -117,9 +118,33 @@ you (`/task …`, or just send/forward any message and tap **➕ Add as task**):
 
 **Buttons** on every card:
 - item: ✅ Done · ⏰ Snooze (2h / 4h / 8h / tomorrow 9:00) · 📅 Due (today / tomorrow / +3 days / next Monday /
-  none / ✏️ type it) · ✖️ Cancel · ✍️ Follow-up · 🔗 Open in Gmail/Chat
+  none / ✏️ type it) · ✖️ Cancel · ✍️ Follow-up · ↩️ Reply (Chat items) · 🔗 Open in Gmail/Chat
 - draft: 📤 Send (asks for confirmation, sends the Gmail draft as it is — including your edits in Gmail) ·
   ✏️ Rewrite (reply with instructions) · ⏰ Snooze · 🗑 Discard · ✔️ Already sent · 🔗 Gmail
+
+### Replying to Google Chat from Telegram
+Chat items (questions from Chat) have **↩️ Reply**: type your answer — or tap **✨ Let Lola draft it** —
+check the preview and press **📤 Send**. It's posted *as you*, in the same Chat thread, and the item is
+closed. Needs the `chat.messages.create` permission: **accounts linked before this feature must `/connect`
+again** (`/accounts` shows which ones). Add the scope to the OAuth consent screen.
+
+### /who and /review
+- `/who alex` — before a call: what you promised them, what they owe you, what they wait for, drafts to
+  them. Matches names and emails (case/accents ignored) and groups "Alex Smith <alex@x.com>" with
+  "alex@x.com". `/who` alone lists people with open items, overdue first.
+- `/review` — walks through items older than `REVIEW_AFTER_DAYS` (7) or overdue with all reminders used:
+  ✅ Done · ✖️ Cancel · 🔁 Remind again (restarts the reminder sequence) · 📅 New deadline · ⏭ Skip · ⏹ Stop.
+  Reviewed items don't come back for a week. Summaries suggest `/review` when 5+ items are getting old.
+
+### How much mail is read
+- Every run reads everything since the previous run, up to `MAX_MESSAGES_PER_RUN` (100) received + 100
+  sent emails per mailbox; if there were more, the newest 100 are analyzed and the summary says so.
+- The first run of a new account looks back `INITIAL_LOOKBACK_HOURS` (1 week), up to
+  `MAX_MESSAGES_FIRST_RUN` (200).
+- Users with their **own AI key have no count limit**.
+- Mail is processed oldest-first in batches of `EMAIL_BATCH_SIZE` (20) per AI call; the position is
+  saved after every batch, so a run that hits the time or AI limit continues where it stopped. A big
+  backlog continues **quietly in the next hourly runs** (no extra summaries) until it's done.
 
 ### Drafts
 - Lola creates replies as **Gmail drafts**; nothing is sent unless you press 📤 Send and confirm.
@@ -228,3 +253,5 @@ PROJECT_ID=test python -m pytest          # or: make test
 python -m uvicorn src.main:app --reload --port 8080
 ```
 Tests run against an in-memory Firestore fake (`tests/fake_firestore.py`) — no GCP credentials needed.
+Test settings come from `tests/.env` (git-ignored; copy `tests/.env.example`) — falling back to
+`tests/.env.example`. Only that file is used, so secrets exported in your shell never leak into tests.

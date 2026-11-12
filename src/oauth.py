@@ -14,7 +14,7 @@ from urllib.parse import urlencode
 
 import httpx
 
-from src.chat_client import CHAT_SCOPES
+from src.chat_client import CHAT_SCOPES, CHAT_SEND_SCOPE
 from src.gmail_client import GMAIL_SCOPES
 
 log = logging.getLogger(__name__)
@@ -24,7 +24,7 @@ TOKEN_URI = "https://oauth2.googleapis.com/token"
 REVOKE_URI = "https://oauth2.googleapis.com/revoke"
 
 IDENTITY_SCOPES = ["openid", "https://www.googleapis.com/auth/userinfo.email"]
-SCOPES = IDENTITY_SCOPES + GMAIL_SCOPES + CHAT_SCOPES
+SCOPES = IDENTITY_SCOPES + GMAIL_SCOPES + CHAT_SCOPES + [CHAT_SEND_SCOPE]
 
 
 class OAuthError(Exception):
@@ -109,6 +109,10 @@ def providers_from_scopes(granted: str) -> list[str]:
     if all(s in scopes for s in CHAT_SCOPES):
         providers.append("chat")
     return providers
+
+
+def can_send_chat(granted: str) -> bool:
+    return CHAT_SEND_SCOPE in set(granted.split())
 
 
 async def revoke_token(token: str) -> bool:

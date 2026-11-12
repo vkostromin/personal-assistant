@@ -14,19 +14,18 @@ def now():
 
 
 @pytest.fixture
-def google(monkeypatch):
-    """Stub Gmail / Chat APIs. Behaviour can be tweaked per account email."""
-    calls = {"gmail_since": {}, "chat_since": {}, "gmail_fail": {}, "chat_fail": {}, "drafts": []}
+def google(monkeypatch, mailbox):
+    """Gmail (fake mailbox, one new email per account per run) + stubbed Chat API."""
+    calls = {"gmail_since": {}, "chat_fail": {}, "drafts": [], "mailbox": mailbox}
 
-    def fetch_recent_messages(account, client_id, client_secret, last_run, max_results=20, sent=False):
-        if sent:
-            calls.setdefault("sent_since", {})[account.email] = last_run
-            return calls.get("sent_messages", {}).get(account.email, [])
-        calls["gmail_since"][account.email] = last_run
-        if account.email in calls["gmail_fail"]:
-            raise calls["gmail_fail"][account.email]
-        return [{"id": "m1", "thread_id": "t1", "from": "x", "to": account.email, "subject": "hi", "date": "",
-                 "body": "?", "message_id_header": "<m1@mail>"}]
+    real_list = mailbox.list_message_ids
+
+    def list_ids(account, client_id, client_secret, since, sent=False, cap=None):
+        if not sent:
+            calls["gmail_since"][account.email] = since
+            if not any(m["internal_ms"] > since.timestamp() * 1000 for m in mailbox.messages.get((account.email, "inbox"), [])):
+                mailbox.add(account.email, thread_id="t1", message_id_header="<m1@mail>")
+        return real_list(account, client_id, client_secret, since, sent=sent, cap=cap)
 
     def create_draft(account, client_id, client_secret, to, subject, body, thread_id=None, in_reply_to=None):
         calls["drafts"].append((account.email, subject, thread_id, in_reply_to))
@@ -38,11 +37,10 @@ def google(monkeypatch):
         return [{"name": "spaces/1", "displayName": "Team"}]
 
     def fetch_messages(account, client_id, client_secret, space, last_run, max_results=30):
-        calls["chat_since"][account.email] = last_run
         return [{"sender": "a", "text": "can you?", "time": "2025-01-01T00:00", "space": "Team"}]
 
-    for name, fn in dict(fetch_recent_messages=fetch_recent_messages, create_draft=create_draft,
-                         list_spaces=list_spaces, fetch_messages=fetch_messages).items():
+    monkeypatch.setattr(runner, "list_message_ids", list_ids)
+    for name, fn in dict(create_draft=create_draft, list_spaces=list_spaces, fetch_messages=fetch_messages).items():
         monkeypatch.setattr(runner, name, fn)
     return calls
 
@@ -58,7 +56,7 @@ async def test_each_user_gets_only_their_own_summary(store, outbox, google):
     await add_user(store, 2, ["b@x.com", "b2@x.com"])
 
     stats = await runner.run_all_users(force=True)
-    assert stats == {"users": 2, "skipped": 0, "errors": 0, "deferred": 0, "not_due": 0}
+    assert stats == {"users": 2, "skipped": 0, "errors": 0, "deferred": 0, "not_due": 0, "backlog": 0}
 
     text1, text2 = outbox.text(1), outbox.text(2)
     assert "a@x.com" in text1 and "b@x.com" not in text1
@@ -75,7 +73,7 @@ async def test_each_user_gets_only_their_own_summary(store, outbox, google):
     assert {i.user_id for i in await store.list_open_items(2)} == {2}
     for email in ("a@x.com", "b@x.com"):
         acc = await store.get_account(email)
-        assert acc.last_run and set(acc.provider_last_run) == {"gmail", "gmail_sent", "chat"}
+        assert acc.last_run and set(acc.provider_last_run) == {"gmail", "chat"}  # no sent mail yet
 
 
 async def test_new_account_looks_back_initial_window_then_uses_watermark(store, google, test_settings):
@@ -101,7 +99,7 @@ async def test_migrated_account_uses_legacy_last_run(store, google):
 
 async def test_revoked_token_marks_reauth_and_tells_the_user(store, outbox, google):
     await add_user(store, 1, ["a@x.com", "ok@x.com"])
-    google["gmail_fail"]["a@x.com"] = RefreshError("invalid_grant: Token has been expired or revoked.")
+    google["mailbox"].fail["a@x.com"] = RefreshError("invalid_grant: Token has been expired or revoked.")
     await runner.run_all_users(force=True)
 
     assert (await store.get_account("a@x.com")).needs_reauth is True
@@ -115,7 +113,7 @@ async def test_revoked_token_marks_reauth_and_tells_the_user(store, outbox, goog
 
 async def test_token_from_old_oauth_client_asks_to_reconnect(store, outbox, google):
     await add_user(store, 1, ["a@x.com"])
-    google["gmail_fail"]["a@x.com"] = RefreshError("unauthorized_client: Unauthorized")
+    google["mailbox"].fail["a@x.com"] = RefreshError("unauthorized_client: Unauthorized")
     await runner.run_all_users(force=True)
     assert (await store.get_account("a@x.com")).needs_reauth is True
     assert "/connect" in outbox.text(1)
@@ -165,7 +163,7 @@ async def test_disabled_and_accountless_users_are_skipped(store, outbox, google)
     await add_user(store, 1, [])
     await add_user(store, 2, ["b@x.com"], status="disabled")
     stats = await runner.run_all_users(force=True)
-    assert stats == {"users": 0, "skipped": 1, "errors": 0, "deferred": 0, "not_due": 0}
+    assert stats == {"users": 0, "skipped": 1, "errors": 0, "deferred": 0, "not_due": 0, "backlog": 0}
     assert list(outbox) == []
 
 
@@ -191,8 +189,8 @@ async def test_limit_reached_mid_run_pauses_analysis_but_digest_is_sent(store, o
     assert text.startswith("SUMMARY") and "AI limit reached" in text and "/setkey" in text
 
     a, b, c = [await store.get_account(e) for e in ("a@x.com", "b@x.com", "c@x.com")]
-    assert set(a.provider_last_run) == {"gmail", "gmail_sent", "chat"}
-    assert set(b.provider_last_run) == {"gmail", "gmail_sent"}  # chat left for next run
+    assert set(a.provider_last_run) == {"gmail", "chat"}
+    assert set(b.provider_last_run) == {"gmail"}  # chat left for next run
     assert c.provider_last_run == {}  # nothing lost, nothing drafted
     assert [d["account"] for d in await store.get_pending_drafts(1)] == ["a@x.com", "b@x.com"]
 
@@ -262,13 +260,12 @@ async def test_sent_mail_creates_promises_and_updates_close_items(store, outbox,
     await add_user(store, 1, ["a@x.com"], timezone="Asia/Jakarta")
     existing = await store.create_item(Item(user_id=1, kind="reply", title="Answer Bob", account="a@x.com"))
     other_users = await store.create_item(Item(user_id=2, kind="todo", title="Not yours"))
-    google["sent_messages"] = {"a@x.com": [
-        {"id": "s1", "thread_id": "ts1", "from": "a@x.com", "to": "bob@x.com", "subject": "Deck",
-         "date": "", "body": "I'll send the deck tomorrow", "message_id_header": "<s1@mail>"}]}
+    [sent_msg] = google["mailbox"].add("a@x.com", sent=True, thread_id="ts1", to="bob@x.com", subject="Deck",
+                                       body="I'll send the deck tomorrow")
     fake_llm.canned["emails I ("] = json.dumps({
         "items": [
             {"kind": "promise", "title": "Send deck to Bob", "counterparty": "bob@x.com",
-             "due_at": "2030-01-11", "priority": "high", "original_email_id": "s1"},
+             "due_at": "2030-01-11", "priority": "high", "original_email_id": sent_msg["id"]},
             {"kind": "reply", "title": "not allowed from sent mail"},
         ],
         "updates": [
@@ -307,3 +304,21 @@ async def test_summary_is_followed_by_focus_buttons(store, outbox, google):
     assert "Focus list" in summary[1] and "Reply to x@y.com" in summary[1]  # ranked focus given to the LLM
     assert "Focus now" in focus[1]
     assert any(b["callback_data"].startswith(("i:open:", "d:open:")) for row in focus[2]["inline_keyboard"] for b in row)
+
+
+async def test_account_deferred_mid_user_is_continued_next_hour(store, outbox, google, monkeypatch):
+    import time as time_
+    await add_user(store, 1, ["a@x.com"])
+    # user starts in time, but the deadline has passed before the account is reached
+    user = await store.get_user(1)
+    await runner.run_for_user(user, deadline=time_.monotonic() - 1)
+    assert (await store.get_account("a@x.com")).backlog is True
+    assert "within the hour" in outbox.text(1)
+
+    from src.schedule import current_slot, user_tz
+    from src.models import utcnow
+    await store.update_user(1, {"last_run_slot": current_slot(utcnow(), user_tz(user))})
+    stats = await runner.run_all_users()  # next hourly run, no slot due
+    assert stats["backlog"] == 1
+    acc = await store.get_account("a@x.com")
+    assert acc.backlog is False and "gmail" in acc.provider_last_run
