@@ -266,3 +266,35 @@ async def test_reminders_respect_quiet_hours_and_cap(store, outbox, bob, monkeyp
     assert stats["reminders"] == 5 and stats["postponed"] == 2  # MAX_REMINDERS_PER_RUN
     stats = await run_reminders(morning + timedelta(hours=1))
     assert stats["reminders"] == 2
+
+
+# ----------------------------------------------------------- review fixes
+async def test_follow_up_without_email_address_is_refused(client, outbox, store, bob, gmail):
+    a = await new_item(store, kind="waiting", counterparty="Alex from accounting")
+    press(client, BOB, f"i:fu:{a}")
+    assert gmail["created"] == []
+    assert "email address" in outbox.last(BOB)[1]
+
+
+async def test_send_with_revoked_token_asks_to_reconnect(client, outbox, store, bob, monkeypatch):
+    from google.auth.exceptions import RefreshError
+
+    def send_draft(**kw):
+        raise RefreshError("invalid_grant: Token has been expired or revoked.")
+
+    monkeypatch.setattr("src.actions.send_draft", send_draft)
+    d = await new_draft(store)
+    press(client, BOB, f"d:sendok:{d}")
+    assert "/connect" in outbox.last(BOB)[1]
+    assert (await store.get_account("bob@x.com")).needs_reauth is True
+    assert (await store.get_draft(d))["status"] == "pending"
+
+
+async def test_signature_command_is_used_for_follow_ups(client, outbox, store, bob, gmail, fake_llm):
+    send(client, BOB, "/signature — Bob (via Lola)")
+    assert (await store.get_user(BOB)).signature == "— Bob (via Lola)"
+    a = await new_item(store, kind="waiting")
+    press(client, BOB, f"i:fu:{a}")
+    assert "— Bob (via Lola)" in fake_llm.prompts("follow-up email")[-1]
+    send(client, BOB, "/signature reset")
+    assert (await store.get_user(BOB)).signature == ""

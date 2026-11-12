@@ -304,3 +304,21 @@ async def test_summary_is_followed_by_focus_buttons(store, outbox, google):
     assert "Focus list" in summary[1] and "Reply to x@y.com" in summary[1]  # ranked focus given to the LLM
     assert "Focus now" in focus[1]
     assert any(b["callback_data"].startswith(("i:open:", "d:open:")) for row in focus[2]["inline_keyboard"] for b in row)
+
+
+async def test_account_deferred_mid_user_is_continued_next_hour(store, outbox, google, monkeypatch):
+    import time as time_
+    await add_user(store, 1, ["a@x.com"])
+    # user starts in time, but the deadline has passed before the account is reached
+    user = await store.get_user(1)
+    await runner.run_for_user(user, deadline=time_.monotonic() - 1)
+    assert (await store.get_account("a@x.com")).backlog is True
+    assert "within the hour" in outbox.text(1)
+
+    from src.schedule import current_slot, user_tz
+    from src.models import utcnow
+    await store.update_user(1, {"last_run_slot": current_slot(utcnow(), user_tz(user))})
+    stats = await runner.run_all_users()  # next hourly run, no slot due
+    assert stats["backlog"] == 1
+    acc = await store.get_account("a@x.com")
+    assert acc.backlog is False and "gmail" in acc.provider_last_run

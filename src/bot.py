@@ -4,20 +4,26 @@ Identity is the Telegram *user id* (``message.from.id``). The bot only works in
 private chats, where chat id == user id, so replies always go to the sender.
 """
 
-import asyncio
 import logging
 from dataclasses import dataclass
 from typing import Awaitable, Callable
 
-from google.auth.exceptions import RefreshError
-
 from src import config
+from src.actions import (
+    ActionError,
+    discard_draft,
+    google_call,
+    mark_draft_sent,
+    owned_account,
+    rewrite_pending_draft,
+    signature_for,
+)
 from src.callbacks import add_task_from_text, handle_callback, handle_free_text
 from src.cards import draft_card, focus_message, numbered_keyboard, people_message, review_card, tasks_message, who_message
 from src.drafts_sync import sync_note, sync_user_drafts
 from src.items import matches_person, person_key, rank_focus, review_queue
-from src.gmail_client import check_drafts, delete_gmail_draft, update_gmail_draft
-from src.llm_client import LLM, LLMError, chat_completion, answer_question, rewrite_draft
+from src.gmail_client import check_drafts
+from src.llm_client import LLM, LLMError, chat_completion, answer_question
 from src.models import User, UserLLMKey, utcnow
 from src.oauth import make_code_verifier, revoke_token
 from src.providers import PROVIDERS, user_llm_config
@@ -50,6 +56,7 @@ USER_HELP = (
     "/disconnect <email> — unlink an account and revoke access\n\n"
     "⚙️ Settings\n"
     "/timezone [zone] — your timezone (summaries at 08:00 and 20:00)\n"
+    "/signature [text|reset] — how drafts are signed\n"
     "/llm — AI provider and usage limit\n"
     "/setkey <provider> <key> [model] — use your own AI key (no limits)\n"
     "/removekey — stop using your own AI key\n"
@@ -463,35 +470,19 @@ async def cmd_sent(ctx: Ctx) -> None:
     selected = await _selected_drafts(ctx, "Usage: /sent N… (e.g. /sent 1 3, /sent 2-4, /sent all)")
     if not selected:
         return
-    store = get_store()
     for d in selected:
-        await store.update_draft(d["id"], {"status": "sent", "status_changed_at": utcnow(), "status_source": "user"})
+        await mark_draft_sent(ctx.user, d)
     await reply(ctx.chat_id, f"✅ {len(selected)} draft(s) marked as sent. /drafts shows the rest.")
 
 
 async def cmd_deletedraft(ctx: Ctx) -> None:
-    s = config.settings
     selected = await _selected_drafts(ctx, "Usage: /deletedraft N… (e.g. /deletedraft 1 3, /deletedraft all)")
     if not selected:
         return
-    store = get_store()
     kept_in_gmail = 0
     for d in selected:
-        account = await store.get_account(d.get("account", ""))
-        if d.get("gmail_draft_id") and account and account.user_id == ctx.user.id:
-            try:
-                ok = await asyncio.to_thread(
-                    delete_gmail_draft,
-                    account=account,
-                    client_id=s.google_client_id,
-                    client_secret=s.google_client_secret,
-                    draft_id=d["gmail_draft_id"],
-                )
-            except RefreshError:
-                ok = False
-            if not ok:
-                kept_in_gmail += 1
-        await store.delete_draft(d["id"])
+        if not await discard_draft(ctx.user, d):
+            kept_in_gmail += 1
     text = f"🗑 {len(selected)} draft(s) deleted."
     if kept_in_gmail:
         text += f" {kept_in_gmail} couldn't be removed from Gmail (no access) — delete them there manually."
@@ -499,7 +490,6 @@ async def cmd_deletedraft(ctx: Ctx) -> None:
 
 
 async def cmd_rewrite(ctx: Ctx) -> None:
-    s = config.settings
     store = get_store()
     parts = ctx.args.split(maxsplit=1)
     if len(parts) < 2:
@@ -516,17 +506,12 @@ async def cmd_rewrite(ctx: Ctx) -> None:
         return
     draft = drafts[idx]
 
-    account = await store.get_account(draft.get("account", ""))
-    if account is None or account.user_id != ctx.user.id:
-        await reply(ctx.chat_id, "The Google account of this draft is no longer linked. See /accounts.")
-        return
-    # Was it sent or deleted in Gmail meanwhile? Then don't rewrite (and don't spend AI tokens).
     try:
-        gone = await asyncio.to_thread(
-            check_drafts, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret, drafts=[draft]
-        )
-    except RefreshError:
-        await reply(ctx.chat_id, f"🔑 Access to {escape_markdown(account.email)} expired — send /connect to reconnect it.")
+        account = await owned_account(ctx.user, draft.get("account", ""))
+        # Was it sent or deleted in Gmail meanwhile? Then don't rewrite (and don't spend AI tokens).
+        gone = await google_call(account, check_drafts, drafts=[draft])
+    except ActionError as exc:
+        await reply(ctx.chat_id, f"❌ {escape_markdown(str(exc))}")
         return
     if draft["id"] in gone:
         status = gone[draft["id"]]
@@ -537,50 +522,17 @@ async def cmd_rewrite(ctx: Ctx) -> None:
     llm = await _get_llm_or_reply(ctx)
     if llm is None:
         return
-    ok, result = await _guarded(
-        ctx,
-        llm,
-        rewrite_draft(
-            to=draft["to"], subject=draft["subject"], body=draft["body"], context=parts[1], llm=llm, signature=s.signature
-        ),
-    )
-    if not ok:
-        return
-    if not result:
-        await reply(ctx.chat_id, "Failed to rewrite draft.")
-        return
-    new_subject = result.get("subject", draft["subject"])
-    new_body = result.get("body", draft["body"])
-
-    # Update the existing Gmail draft in place (no duplicates). Gmail first, so Firestore
-    # never claims a text that isn't in the user's mailbox.
-    old_gmail_id = draft.get("gmail_draft_id")
     try:
-        gmail_id, created_new = await asyncio.to_thread(
-            update_gmail_draft,
-            account=account,
-            client_id=s.google_client_id,
-            client_secret=s.google_client_secret,
-            draft_id=old_gmail_id,
-            to=draft["to"],
-            subject=new_subject,
-            body=new_body,
-            thread_id=draft.get("thread_id"),
-            in_reply_to=draft.get("in_reply_to"),
-        )
-    except RefreshError:
-        await reply(ctx.chat_id, f"🔑 Access to {escape_markdown(account.email)} expired — send /connect to reconnect it.")
+        ok, updated = await _guarded(ctx, llm, rewrite_pending_draft(ctx.user, draft, parts[1], llm))
+    except ActionError as exc:
+        await reply(ctx.chat_id, f"❌ {escape_markdown(str(exc))}")
         return
-    if gmail_id is None:
-        await reply(ctx.chat_id, "❌ Gmail rejected the draft update. Please try again later.")
-        return
-    await store.update_draft(draft["id"], {"subject": new_subject, "body": new_body, "gmail_draft_id": gmail_id})
-    note = " (the original was no longer in Gmail, so a new draft was created)" if created_new and old_gmail_id else ""
-    await reply(ctx.chat_id, f"✅ Draft updated in Gmail{note}.")
+    if ok:
+        note = " (the original was no longer in Gmail, so a new draft was created)" if updated["recreated"] else ""
+        await reply(ctx.chat_id, f"✅ Draft updated in Gmail{note}.")
 
 
 async def cmd_raw(ctx: Ctx) -> None:
-    s = config.settings
     if not ctx.args:
         await reply(ctx.chat_id, "Usage: /raw <text>")
         return
@@ -596,7 +548,7 @@ async def cmd_raw(ctx: Ctx) -> None:
             promises_summary="",
             last_activity="",
             llm=llm,
-            signature=s.signature,
+            signature=signature_for(ctx.user),
         ),
     )
     if ok:
@@ -604,7 +556,6 @@ async def cmd_raw(ctx: Ctx) -> None:
 
 
 async def cmd_chat(ctx: Ctx) -> None:
-    s = config.settings
     store = get_store()
     if not ctx.args:
         await reply(ctx.chat_id, "Usage: /chat <question>")
@@ -625,9 +576,9 @@ async def cmd_chat(ctx: Ctx) -> None:
                 f"- [{i.kind}] {i.title}" + (f" (due {fmt_local(i.due_at, ctx.user)})" if i.due_at else "")
                 for i in items[:15]
             ) or "none",
-            last_activity=max(runs).strftime("%b %d %H:%M") if runs else "never",
+            last_activity=fmt_local(max(runs), ctx.user) if runs else "never",
             llm=llm,
-            signature=s.signature,
+            signature=signature_for(ctx.user),
         ),
     )
     if ok:
@@ -725,6 +676,23 @@ async def cmd_timezone(ctx: Ctx) -> None:
         f"✅ Timezone set to {escape_markdown(tz)} (now {fmt_local(now, updated, '%H:%M')}). "
         f"Summaries at {hours}; the next one at {next_local}.",
     )
+
+
+async def cmd_signature(ctx: Ctx) -> None:
+    store = get_store()
+    value = ctx.args.strip()
+    if not value:
+        current = ctx.user.signature or config.settings.signature.strip()
+        await reply(
+            ctx.chat_id,
+            f"✍️ Drafts are signed with:\n{escape_markdown(current)}\n\n"
+            "Change it: `/signature — Anna, sent with Lola`, or `/signature reset` for the default.",
+        )
+        return
+    signature = "" if value.lower() == "reset" else value[:200]
+    await store.update_user(ctx.user.id, {"signature": signature})
+    shown = signature or config.settings.signature.strip()
+    await reply(ctx.chat_id, f"✅ New drafts will be signed with:\n{escape_markdown(shown)}")
 
 
 async def cmd_deleteme(ctx: Ctx) -> None:
@@ -1008,6 +976,7 @@ USER_COMMANDS: dict[str, Handler] = {
     "/sent": cmd_sent,
     "/deletedraft": cmd_deletedraft,
     "/timezone": cmd_timezone,
+    "/signature": cmd_signature,
     "/deleteme": cmd_deleteme,
     "/status": cmd_status,
     "/drafts": cmd_drafts,

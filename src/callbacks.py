@@ -12,6 +12,7 @@ from src.actions import (
     close_item,
     discard_draft,
     follow_up,
+    signature_for,
     mark_draft_sent,
     rewrite_pending_draft,
     send_pending_draft,
@@ -371,7 +372,7 @@ async def ask_lola(user: User, chat_id: int, question: str) -> None:
                                        for i in items[:15]) or "none",
             last_activity="",
             llm=llm,
-            signature=config.settings.signature,
+            signature=signature_for(user),
         )
     except (QuotaExceeded, LLMError) as exc:
         await _llm_failed(user, chat_id, exc)

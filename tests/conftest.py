@@ -1,3 +1,4 @@
+import re
 import json
 import os
 from pathlib import Path
@@ -129,11 +130,13 @@ class FakeLLM:
                 return content, self.tokens_per_call
         if "Analyze these emails received by" in prompt:
             account = prompt.split("Analyze these emails received by ")[1].split(".\n")[0]
+            first = re.search(r"Message ID: (\S+)", prompt)  # reply to the email actually shown
+            msg_id = first.group(1) if first else "m1"
             content = json.dumps({
-                "drafts": [{"to": "x@y.com", "subject": f"Re: {account}", "body": "b", "original_email_id": "m1",
+                "drafts": [{"to": "x@y.com", "subject": f"Re: {account}", "body": "b", "original_email_id": msg_id,
                             "priority": "high"}],
                 "items": [{"kind": "waiting", "title": f"promise from {account}", "counterparty": "x@y.com",
-                           "due_at": None, "priority": "medium", "original_email_id": "m1"}],
+                           "due_at": None, "priority": "medium", "original_email_id": msg_id}],
                 "updates": [],
                 "summary_items": [f"email item for {account}"],
             })
@@ -191,7 +194,7 @@ def gmail_drafts(monkeypatch):
     fake = FakeGmailDrafts()
     monkeypatch.setattr("src.drafts_sync.check_drafts", fake.check_drafts)
     monkeypatch.setattr("src.bot.check_drafts", fake.check_drafts)
-    monkeypatch.setattr("src.bot.delete_gmail_draft", fake.delete_gmail_draft)
+    monkeypatch.setattr("src.actions.delete_gmail_draft", fake.delete_gmail_draft)
     return fake
 
 

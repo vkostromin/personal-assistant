@@ -93,7 +93,8 @@ def fetch_messages(
             }
         )
 
-    return filtered
+    # the API returns newest first; the LLM needs the conversation in order to see what was answered later
+    return sorted(filtered, key=lambda m: m["time"])
 
 
 def space_link(space: dict | str) -> str:

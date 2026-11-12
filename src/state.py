@@ -11,6 +11,7 @@ invites/{code}             single-use invitation codes
 oauth_states/{state}       pending "connect Google account" links (single use)
 usage/{telegram_user_id}   shared-LLM token usage in the current window
 llm_keys/{telegram_user_id} user's own LLM provider + encrypted API key
+telegram_updates/{update_id} seen webhook updates (dedupe of Telegram retries, TTL expires_at)
 settings/app               admin_user_id, schema_version
 settings/global, state/global   legacy single-user docs (read once by the migration)
 """
@@ -435,6 +436,21 @@ class FirestoreStore:
         """Single-field range query (automatic index). Closed items have next_remind_at = None."""
         query = self.db.collection("items").where(filter=FieldFilter("next_remind_at", "<=", now))
         return [self._item_from_doc(doc) async for doc in query.stream()]
+
+    # ------------------------------------------------------ webhook dedupe
+    async def claim_update(self, update_id: int) -> bool:
+        """Record a Telegram update id; False if it was seen before.
+
+        Telegram re-delivers an update when the webhook answers slowly (LLM calls) or
+        fails, which would otherwise run a command — e.g. "send draft" — twice."""
+        from google.api_core.exceptions import AlreadyExists
+
+        ref = self.db.collection("telegram_updates").document(str(update_id))
+        try:
+            await ref.create({"created_at": utcnow(), "expires_at": utcnow() + timedelta(days=2)})
+        except AlreadyExists:
+            return False
+        return True
 
     # ------------------------------------------------------- pending actions
     async def set_pending_action(self, user_id: int, action: dict | None) -> None:

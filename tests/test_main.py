@@ -73,6 +73,7 @@ class TestRunAuth:
         use_settings(monkeypatch, run_secret=RUN_SECRET)
         with patch("src.main.run_all_users", new_callable=AsyncMock) as run:
             response = client.post("/run")
+        assert response.status_code == 401
         assert response.json() == {"status": "unauthorized"}
         run.assert_not_called()
 
@@ -80,6 +81,7 @@ class TestRunAuth:
         use_settings(monkeypatch, run_secret=RUN_SECRET)
         with patch("src.main.run_all_users", new_callable=AsyncMock) as run:
             response = client.post("/run", headers={"X-Run-Secret": RUN_SECRET + "-wrong"})
+        assert response.status_code == 401
         assert response.json() == {"status": "unauthorized"}
         run.assert_not_called()
 
@@ -115,3 +117,20 @@ def test_startup_runs_migration(store, fake_db):
     with TestClient(app):  # triggers lifespan
         pass
     assert fake_db.data["settings"]["app"]["admin_user_id"] == 42
+
+
+class TestWebhookDedupe:
+    def test_redelivered_update_is_processed_once(self, client, monkeypatch, outbox):
+        use_settings(monkeypatch, telegram_webhook_secret=WEBHOOK_SECRET)
+        body = {
+            "update_id": 777,
+            "message": {"message_id": 1, "from": {"id": 42, "first_name": "A"},
+                        "chat": {"id": 42, "type": "private"}, "text": "/start"},
+        }
+        headers = {"X-Telegram-Bot-Api-Secret-Token": WEBHOOK_SECRET}
+        client.post("/webhook", json=body, headers=headers)
+        first = len(outbox.to(42))
+        assert first > 0
+        response = client.post("/webhook", json=body, headers=headers)
+        assert response.json() == {"ok": True}
+        assert len(outbox.to(42)) == first

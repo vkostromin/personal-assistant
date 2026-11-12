@@ -7,10 +7,8 @@ import time
 from dataclasses import dataclass, field
 from datetime import datetime, timedelta, timezone
 
-from google.auth.exceptions import RefreshError
-
 from src import config
-from src.actions import add_item, apply_update
+from src.actions import add_item, apply_update, is_revoked, signature_for
 from src.cards import entry_line, focus_message
 from src.chat_client import fetch_messages, list_spaces, space_link
 from src.drafts_sync import sync_note, sync_user_drafts
@@ -40,15 +38,6 @@ class UserRunResult:
     truncated: dict[str, int] = field(default_factory=dict)  # account -> cap that was hit
     backlog: list[str] = field(default_factory=list)
     llm_error: str = ""
-
-
-def _is_revoked(exc: BaseException) -> bool:
-    """Token can't be used any more and the user must sign in again.
-
-    invalid_grant: revoked / expired (e.g. 7-day limit for apps in Testing status)
-    unauthorized_client: token was issued to a different OAuth client (old Desktop client)
-    """
-    return isinstance(exc, RefreshError) and any(code in str(exc) for code in ("invalid_grant", "unauthorized_client"))
 
 
 async def run_all_users(now: datetime | None = None, force: bool = False) -> dict:
@@ -135,6 +124,8 @@ async def run_for_user(
         if deadline is not None and time.monotonic() > deadline:
             log.warning("Run deadline reached — account %s deferred to next run", account.email)
             result.deferred.append(account.email)
+            # picked up quietly by the next hourly run instead of waiting for the next summary slot
+            await store.update_account(account.email, {"backlog": True})
             continue
         await _process_account(user, account, result, llm, now, deadline)
 
@@ -165,7 +156,7 @@ async def run_for_user(
                 promises=promises_text,
                 date=date,
                 llm=llm,
-                signature=s.signature,
+                signature=signature_for(user),
                 focus=focus_text,
             )
         except LLMError as exc:
@@ -205,7 +196,7 @@ async def run_for_user(
     for email in result.backlog:
         notes.append(f"⏳ Still working through {escape_markdown(email)} — the rest is processed in the next hour(s).")
     for email in result.deferred:
-        notes.append(f"⏱ {escape_markdown(email)} will be checked at the next run (this run ran out of time).")
+        notes.append(f"⏱ {escape_markdown(email)} wasn't checked yet (this run ran out of time) — it's done within the hour.")
     for email in result.failed:
         notes.append(f"⚠️ Could not check {escape_markdown(email)} this time; will retry next run.")
     text = "\n\n".join(part for part in [summary, "\n".join(notes)] if part)
@@ -296,7 +287,7 @@ async def _process_account(
         except Exception as exc:  # noqa: BLE001
             if isinstance(exc, LLMError):
                 result.llm_error = result.llm_error or str(exc)
-            if _is_revoked(exc):
+            if is_revoked(exc):
                 await _mark_reauth(account, result)
                 return False
             failed = True
@@ -343,7 +334,7 @@ async def _process_account(
             if sent:
                 analysis = await analyze_sent(batch, account.email, llm, await _context(user, now))
             else:
-                analysis = await analyze_emails(batch, account.email, llm, s.signature, await _context(user, now))
+                analysis = await analyze_emails(batch, account.email, llm, signature_for(user), await _context(user, now))
                 await _save_drafts(user, account, analysis, result)
                 result.email_items.extend(analysis.summary_items)
             await _apply(user, analysis, result, source="sent" if sent else "email", account=account, messages=batch)

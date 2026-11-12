@@ -78,6 +78,8 @@ class User(BaseModel):
     token_limit: Optional[int] = None
     # IANA name ("Asia/Jakarta") or fixed offset ("+05:30"); "" = DEFAULT_TIMEZONE
     timezone: str = ""
+    # Sign-off for drafts and summaries (/signature); "" = SIGNATURE from the server config
+    signature: str = ""
     # Last summary slot (UTC) this user was processed for — see src/schedule.py
     last_run_slot: Optional[datetime] = None
     # Waiting for free text from the user, e.g. {"type": "rewrite", "ref": draft_id, "expires_at": ...}

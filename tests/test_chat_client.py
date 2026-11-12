@@ -52,3 +52,17 @@ def test_my_messages_are_marked_me():
     assert [(m["sender"], m["is_me"]) for m in msgs] == [("Me", True), ("Ann", False)]
     assert space_link({"name": "spaces/AAA", "spaceType": "DIRECT_MESSAGE"}) == "https://chat.google.com/dm/AAA"
     assert space_link("spaces/BBB") == "https://chat.google.com/room/BBB"
+
+
+def test_messages_are_returned_oldest_first():
+    from unittest.mock import MagicMock
+    from src.chat_client import fetch_messages
+    acc = Account(email="me@x.com", refresh_token="t")
+    svc = MagicMock()
+    svc.spaces.return_value.messages.return_value.list.return_value.execute.return_value = {"messages": [
+        {"sender": {"name": "users/2", "displayName": "Ann"}, "text": "answered", "createTime": "2030-01-01T10:05:00Z"},
+        {"sender": {"name": "users/2", "displayName": "Ann"}, "text": "question?", "createTime": "2030-01-01T10:00:00Z"},
+    ]}
+    with patch("src.chat_client._get_service", return_value=svc):
+        msgs = fetch_messages(acc, "c", "s", {"name": "spaces/AAA"}, last_run=None)
+    assert [m["text"] for m in msgs] == ["question?", "answered"]

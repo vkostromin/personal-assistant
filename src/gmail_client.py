@@ -101,6 +101,7 @@ def get_messages(account: Account, client_id: str, client_secret: str, ids: list
                 "thread_id": full.get("threadId", ""),
                 "internal_ms": int(full.get("internalDate", 0)),
                 "from": headers.get("from", ""),
+                "reply_to": headers.get("reply-to", ""),
                 "to": headers.get("to", ""),
                 "subject": headers.get("subject", ""),
                 "date": headers.get("date", ""),

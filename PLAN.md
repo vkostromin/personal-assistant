@@ -54,7 +54,7 @@ Cloud Run URL: see SERVICE_URL in .env
 | Notifications | Telegram bot (token in `.env`) |
 | Gmail integration | Direct API — fetch max 20 emails, body truncated at 2000 chars, create drafts, never auto-send |
 | Chat integration | Google Chat API — read-only |
-| Email signature | Configurable via `SIGNATURE` (default "Lola, Your AI Assistant") |
+| Email signature | Per user via `/signature`; server default `SIGNATURE` ("Lola, Your AI Assistant") |
 | Users | `users/{telegram_user_id}`; first `/start` on a fresh deployment = admin, others need a single-use invite |
 | Identity | Telegram `from.id`; private chats only |
 | Accounts | `accounts/{email}` owned by exactly one user (`user_id`); a user can link several |

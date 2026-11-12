@@ -1,3 +1,4 @@
+import itertools
 import re
 
 import pytest
@@ -10,6 +11,7 @@ from tests.conftest import BASE_URL, BOT_USERNAME, WEBHOOK_HEADERS, make_setting
 
 HEADERS = WEBHOOK_HEADERS
 ADMIN, BOB, EVE = 1001, 2002, 3003
+_update_ids = itertools.count(1)
 
 
 @pytest.fixture
@@ -19,7 +21,7 @@ def client():
 
 def send(client, uid, text, chat_type="private", chat_id=None, username=""):
     body = {
-        "update_id": 1,
+        "update_id": next(_update_ids),
         "message": {
             "message_id": 1,
             "from": {"id": uid, "first_name": f"U{uid}", "username": username},

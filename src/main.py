@@ -3,7 +3,7 @@ import logging
 from contextlib import asynccontextmanager
 
 from fastapi import FastAPI, Request
-from fastapi.responses import HTMLResponse
+from fastapi.responses import HTMLResponse, JSONResponse
 
 from src import config
 from src.bot import handle_update, reply
@@ -28,6 +28,8 @@ async def lifespan(_app: FastAPI):
         log.warning("RUN_SECRET is not set — anyone can trigger /run for all users. Set it!")
     if not s.token_encryption_key:
         log.warning("TOKEN_ENCRYPTION_KEY is not set — refresh tokens are stored unencrypted.")
+    if not s.admin_telegram_id:
+        log.warning("ADMIN_TELEGRAM_ID is not set — if there is no admin, whoever sends /start first becomes admin.")
     try:
         await get_store().migrate_legacy()
     except Exception as exc:  # noqa: BLE001 — never block startup on migration
@@ -59,6 +61,14 @@ async def telegram_webhook(request: Request, body: dict):
     if config.settings.telegram_webhook_secret and secret != config.settings.telegram_webhook_secret:
         log.warning("Telegram webhook received invalid secret token")
         return {"ok": False}
+    update_id = body.get("update_id")
+    if isinstance(update_id, int):
+        try:
+            if not await get_store().claim_update(update_id):
+                log.info("Duplicate Telegram update %s ignored", update_id)
+                return {"ok": True}
+        except Exception as exc:  # noqa: BLE001 — dedupe is best effort
+            log.warning("Could not record update %s: %s", update_id, exc)
     try:
         await handle_update(body, public_base_url(request))
     except Exception as exc:  # noqa: BLE001 — return 200 so Telegram doesn't retry forever
@@ -80,7 +90,7 @@ async def scheduled_run(request: Request, force: bool = False):
     secret = request.headers.get("X-Run-Secret", "")
     if config.settings.run_secret and secret != config.settings.run_secret:
         log.warning("Scheduled run received invalid secret token")
-        return {"status": "unauthorized"}
+        return JSONResponse({"status": "unauthorized"}, status_code=401)
     # reminders first: cheap (no LLM) and time-sensitive
     reminder_stats = await run_reminders()
     stats = await run_all_users(force=force)

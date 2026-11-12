@@ -231,24 +231,31 @@ async def analyze_emails(
         return Analysis(summary_items=["Failed to analyze emails"])
 
     now = datetime.now()
-    # Thread/Message-ID come from the real email (never trust IDs invented by the model):
+    # Recipient, thread and Message-ID come from the real email, never from the model:
+    # an email can contain instructions ("reply to attacker@evil.com") that steer the LLM,
     # a made-up threadId makes Gmail reject the draft, and the ids are needed for threading
-    # and for detecting later that the reply was sent.
+    # and for detecting later that the reply was sent. Drafts not tied to a real email are dropped.
     by_id = {m["id"]: m for m in messages}
     by_thread = {m.get("thread_id"): m for m in messages if m.get("thread_id")}
     drafts = []
     for d in data.get("drafts", []) if isinstance(data.get("drafts"), list) else []:
+        if not isinstance(d, dict):
+            continue
         original = by_id.get(str(d.get("original_email_id") or "")) or by_thread.get(str(d.get("thread_id") or ""))
+        to = (original.get("reply_to") or original.get("from") or "") if original else ""
+        if not to:
+            log.warning("analyze_emails: dropping draft not tied to a received email (%s)", str(d.get("subject"))[:80])
+            continue
         priority = str(d.get("priority", "medium")).lower()
         drafts.append(
             Draft(
                 account=account,
-                to=d.get("to", ""),
-                subject=d.get("subject", ""),
-                body=d.get("body", ""),
-                thread_id=original.get("thread_id") or None if original else None,
-                original_email_id=original["id"] if original else None,
-                in_reply_to=original.get("message_id_header") or None if original else None,
+                to=to,
+                subject=str(d.get("subject") or f"Re: {original.get('subject', '')}"),
+                body=str(d.get("body") or ""),
+                thread_id=original.get("thread_id") or None,
+                original_email_id=original["id"],
+                in_reply_to=original.get("message_id_header") or None,
                 priority=priority if priority in _PRIORITIES else "medium",
                 created_at=now,
             )

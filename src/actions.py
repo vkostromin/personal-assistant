@@ -2,6 +2,8 @@
 
 import asyncio
 import logging
+import re
+from email.utils import parseaddr
 from datetime import datetime, timedelta
 
 from google.auth.exceptions import RefreshError
@@ -20,6 +22,45 @@ log = logging.getLogger(__name__)
 
 class ActionError(Exception):
     """User-facing failure (message is shown in Telegram)."""
+
+
+def is_revoked(exc: BaseException) -> bool:
+    """Token can't be used any more and the user must sign in again.
+
+    invalid_grant: revoked / expired (e.g. 7-day limit for apps in Testing status)
+    unauthorized_client: token was issued to a different OAuth client (old Desktop client)
+    """
+    return isinstance(exc, RefreshError) and any(code in str(exc) for code in ("invalid_grant", "unauthorized_client"))
+
+
+def signature_for(user: User) -> str:
+    """Sign-off for drafts and summaries: the user's own (/signature) or the server default."""
+    return "\n\n" + (user.signature or config.settings.signature).strip()
+
+
+_EMAIL = re.compile(r"[\w.+'-]+@[\w-]+(?:\.[\w-]+)+")
+
+
+def email_address(text: str) -> str:
+    """First email address in free text ("Alex <alex@x.com>" -> "alex@x.com"), or ""."""
+    m = _EMAIL.search(text or "")
+    return m.group(0) if m else ""
+
+
+async def google_call(account: Account, fn, **kwargs):
+    """Run a blocking Gmail/Chat client function for ``account`` in a thread.
+
+    An expired/revoked token becomes a user-facing ActionError, and the account is
+    flagged so /accounts and the next summary ask the user to /connect again."""
+    s = config.settings
+    try:
+        return await asyncio.to_thread(
+            fn, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret, **kwargs
+        )
+    except RefreshError as exc:
+        if is_revoked(exc):
+            await get_store().update_account(account.email, {"needs_reauth": True})
+        raise ActionError(f"Access to {account.email} expired — send /connect to reconnect it.") from exc
 
 
 # -------------------------------------------------------------------- items
@@ -100,7 +141,7 @@ async def set_due_choice(user: User, item: Item, choice: str) -> Item:
     return await set_due(user, item, due_choice(choice, utcnow(), user_tz(user)))
 
 
-async def _owned_account(user: User, email: str) -> Account:
+async def owned_account(user: User, email: str) -> Account:
     account = await get_store().get_account(email)
     if account is None or account.user_id != user.id:
         raise ActionError("The Google account is no longer linked. See /accounts.")
@@ -113,7 +154,7 @@ async def chat_reply_account(user: User, item: Item) -> Account:
     """The account to reply from; raises ActionError with what to do if replying isn't possible."""
     if not item.space or not item.account:
         raise ActionError("This item isn't from Google Chat.")
-    account = await _owned_account(user, item.account)
+    account = await owned_account(user, item.account)
     if not account.chat_send:
         raise ActionError(
             f"Replying from Telegram needs one more permission. Send /connect and sign in with {account.email} again."
@@ -122,15 +163,8 @@ async def chat_reply_account(user: User, item: Item) -> Account:
 
 
 async def send_chat_reply(user: User, item: Item, text: str) -> None:
-    s = config.settings
     account = await chat_reply_account(user, item)
-    try:
-        sent = await asyncio.to_thread(
-            send_chat_message, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret,
-            space=item.space, text=text, thread=item.chat_thread,
-        )
-    except RefreshError as exc:
-        raise ActionError(f"Access to {account.email} expired — send /connect to reconnect it.") from exc
+    sent = await google_call(account, send_chat_message, space=item.space, text=text, thread=item.chat_thread)
     if not sent:
         raise ActionError("Google Chat refused the message.")
     await close_item(user, item, "done", "replied from Telegram")
@@ -141,16 +175,20 @@ async def follow_up(user: User, item: Item, llm: LLM) -> dict:
     s = config.settings
     if not (item.thread_id and item.account):
         raise ActionError("This item isn't linked to an email thread.")
-    account = await _owned_account(user, item.account)
+    address = email_address(item.counterparty)
+    if not address:
+        raise ActionError("I don't know their email address — open the thread in Gmail to follow up.")
+    # keep "Name <email>" when it's a well-formed address, otherwise just the email
+    to = item.counterparty.strip() if parseaddr(item.counterparty)[1] == address else address
+    account = await owned_account(user, item.account)
     due = fmt_local(item.due_at, user, "%a %d %b") if item.due_at else "recently"
-    text = await write_follow_up(item, due, llm, s.signature)
+    text = await write_follow_up(item, due, llm, signature_for(user))
     if not text:
         raise ActionError("Couldn't write a follow-up. Try again later.")
-    to = item.counterparty
     subject = text.get("subject") or (f"Re: {item.subject}" if item.subject else "Follow-up")
-    gmail_id = await asyncio.to_thread(
-        create_draft, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret,
-        to=to, subject=subject, body=text["body"], thread_id=item.thread_id, in_reply_to=item.in_reply_to,
+    gmail_id = await google_call(
+        account, create_draft, to=to, subject=subject, body=text["body"], thread_id=item.thread_id,
+        in_reply_to=item.in_reply_to,
     )
     if not gmail_id:
         raise ActionError("Gmail rejected the follow-up draft.")
@@ -168,14 +206,10 @@ async def follow_up(user: User, item: Item, llm: LLM) -> dict:
 
 # ------------------------------------------------------------------- drafts
 async def send_pending_draft(user: User, draft: dict) -> None:
-    s = config.settings
     if not draft.get("gmail_draft_id"):
         raise ActionError("This draft isn't in Gmail — open Gmail to send it.")
-    account = await _owned_account(user, draft.get("account", ""))
-    sent = await asyncio.to_thread(
-        send_draft, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret,
-        draft_id=draft["gmail_draft_id"],
-    )
+    account = await owned_account(user, draft.get("account", ""))
+    sent = await google_call(account, send_draft, draft_id=draft["gmail_draft_id"])
     if not sent:
         raise ActionError("Gmail refused to send it (was it already sent or deleted?). Check /drafts.")
     store = get_store()
@@ -191,15 +225,11 @@ async def send_pending_draft(user: User, draft: dict) -> None:
 
 async def discard_draft(user: User, draft: dict) -> bool:
     """Delete in Gmail and in Lola. Returns False if it couldn't be removed from Gmail."""
-    s = config.settings
     removed = True
     if draft.get("gmail_draft_id"):
         try:
-            account = await _owned_account(user, draft.get("account", ""))
-            removed = await asyncio.to_thread(
-                delete_gmail_draft, account=account, client_id=s.google_client_id,
-                client_secret=s.google_client_secret, draft_id=draft["gmail_draft_id"],
-            )
+            account = await owned_account(user, draft.get("account", ""))
+            removed = await google_call(account, delete_gmail_draft, draft_id=draft["gmail_draft_id"])
         except ActionError:
             removed = False
     await get_store().delete_draft(draft["id"])
@@ -219,23 +249,23 @@ async def snooze_draft(user: User, draft: dict, choice: str) -> datetime:
 
 
 async def rewrite_pending_draft(user: User, draft: dict, instructions: str, llm: LLM) -> dict:
-    """LLM rewrite + update the same Gmail draft in place. Returns the updated record."""
-    s = config.settings
-    account = await _owned_account(user, draft.get("account", ""))
+    """LLM rewrite + update the same Gmail draft in place. Returns the updated record
+    (``recreated`` = the Gmail draft was gone, so a new one was created)."""
+    account = await owned_account(user, draft.get("account", ""))
     result = await rewrite_draft(
-        to=draft["to"], subject=draft["subject"], body=draft["body"], context=instructions, llm=llm, signature=s.signature
+        to=draft["to"], subject=draft["subject"], body=draft["body"], context=instructions, llm=llm, signature=signature_for(user)
     )
     if not result:
         raise ActionError("Failed to rewrite the draft.")
     new_subject = result.get("subject", draft["subject"])
     new_body = result.get("body", draft["body"])
-    gmail_id, _ = await asyncio.to_thread(
-        update_gmail_draft, account=account, client_id=s.google_client_id, client_secret=s.google_client_secret,
-        draft_id=draft.get("gmail_draft_id"), to=draft["to"], subject=new_subject, body=new_body,
-        thread_id=draft.get("thread_id"), in_reply_to=draft.get("in_reply_to"),
+    old_gmail_id = draft.get("gmail_draft_id")
+    gmail_id, created_new = await google_call(
+        account, update_gmail_draft, draft_id=old_gmail_id, to=draft["to"], subject=new_subject,
+        body=new_body, thread_id=draft.get("thread_id"), in_reply_to=draft.get("in_reply_to"),
     )
     if gmail_id is None:
         raise ActionError("Gmail rejected the draft update. Please try again later.")
     updates = {"subject": new_subject, "body": new_body, "gmail_draft_id": gmail_id}
     await get_store().update_draft(draft["id"], updates)
-    return {**draft, **updates}
+    return {**draft, **updates, "recreated": bool(created_new and old_gmail_id)}

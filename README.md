@@ -65,7 +65,7 @@ gcloud scheduler jobs create http lola-run --location=us-central1 \
   --schedule="0 * * * *" --time-zone="Etc/UTC" \
   --uri="$(gcloud run services describe personal-assistant --region=us-central1 --format='value(status.url)')/run" \
   --http-method=POST --headers=X-Run-Secret=$RUN_SECRET --attempt-deadline=300s
-make setup-firestore-ttl   # optional: auto-clean expired sign-in links
+make setup-firestore-ttl   # optional: auto-clean expired sign-in links and webhook dedupe records
 ```
 
 ### 7. Become the admin
@@ -93,7 +93,7 @@ will be linked to, to protect people from "please click this link" phishing.
 | `/status`, `/chat <question>`, `/raw <text>` | `/invite [note]`, `/invites`, `/revoke <code>` |
 | Drafts: `/drafts`, `/draft N`, `/rewrite N <context>`, `/sent N…`, `/deletedraft N…` | `/users`, `/disable <id>`, `/enable <id>` |
 | Google: `/connect`, `/accounts`, `/unlink [email] <gmail\|chat>`, `/disconnect <email>` | `/remove <id>` — deletes the user, their accounts (tokens revoked), drafts and promises |
-| Settings: `/timezone [zone]`, `/llm`, `/setkey <provider> <key> [model]`, `/removekey` | `/setlimit <id> <tokens\|default\|unlimited>` — e.g. `/setlimit 12345 300k` |
+| Settings: `/timezone [zone]`, `/signature [text\|reset]`, `/llm`, `/setkey <provider> <key> [model]`, `/removekey` | `/setlimit <id> <tokens\|default\|unlimited>` — e.g. `/setlimit 12345 300k` |
 | `/deleteme` — delete own account and all data (confirm with `/deleteme YES`), `/help` | `/transferadmin <id>` — hand the admin role to another user |
 
 ### Focus, promises and reminders

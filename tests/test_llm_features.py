@@ -38,7 +38,7 @@ def gmail(monkeypatch):
         calls.append(dict(account=account.email, draft_id=draft_id, subject=subject, body=body, thread_id=thread_id))
         return (draft_id or "created-id"), draft_id is None
 
-    monkeypatch.setattr("src.bot.update_gmail_draft", fake_update)
+    monkeypatch.setattr("src.actions.update_gmail_draft", fake_update)
     return calls
 
 
@@ -66,7 +66,7 @@ async def test_rewrite_updates_existing_gmail_draft_instead_of_creating(client, 
 
 async def test_rewrite_recreated_draft_id_is_stored(client, outbox, store, users, monkeypatch):
     await add_draft(store, gmail_draft_id="deleted-in-gmail")
-    monkeypatch.setattr("src.bot.update_gmail_draft", lambda **kw: ("fresh-id", True))
+    monkeypatch.setattr("src.actions.update_gmail_draft", lambda **kw: ("fresh-id", True))
     send(client, BOB, "/rewrite 1 ctx")
     [d] = await store.get_pending_drafts(BOB)
     assert d["gmail_draft_id"] == "fresh-id"
@@ -75,7 +75,7 @@ async def test_rewrite_recreated_draft_id_is_stored(client, outbox, store, users
 
 async def test_rewrite_gmail_failure_keeps_store_unchanged(client, outbox, store, users, monkeypatch):
     await add_draft(store)
-    monkeypatch.setattr("src.bot.update_gmail_draft", lambda **kw: (None, False))
+    monkeypatch.setattr("src.actions.update_gmail_draft", lambda **kw: (None, False))
     send(client, BOB, "/rewrite 1 ctx")
     [d] = await store.get_pending_drafts(BOB)
     assert d["body"] == "old body"
